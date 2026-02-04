@@ -1,0 +1,6 @@
+{
+  "name": "thumbnail-downloader",
+  "version": "1.0.0",
+  "description": "Get video thumbnails from YouTube, Vimeo, Dailymotion. Go to video page → Get Data → Run CD to download.",
+  "author": "CD-Driver"
+}
