@@ -2,11 +2,10 @@
  * Media Downloader CD
  *
  * Downloads media from:
+ * - YouTube (via YouTube.js - handles signature decryption)
  * - Direct media URLs (.mp4, .mp3, .webm, etc.)
- * - YouTube (extracts available streams)
  *
- * Note: YouTube uses adaptive streaming. Some formats may not be available
- * without signature decryption (which requires yt-dlp).
+ * Uses background service worker for YouTube.js integration.
  */
 
 var MEDIA_EXTENSIONS = {
@@ -23,8 +22,8 @@ function DataCollector(currentUrl) {
     timestamp: Date.now(),
     pageUrl: currentUrl || '',
     site: null,
+    videoId: null,
     candidates: [],
-    videoInfo: null,
     message: ''
   };
 
@@ -62,59 +61,34 @@ function DataCollector(currentUrl) {
     return null;
   }
 
-  // Check for YouTube
-  if (currentUrl.includes('youtube.com/watch') || currentUrl.includes('youtu.be/')) {
-    result.site = 'youtube';
+  // Extract YouTube video ID from various URL formats
+  function extractYouTubeId(url) {
+    var patterns = [
+      /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+      /[?&]v=([a-zA-Z0-9_-]{11})/
+    ];
 
-    // Extract video ID
-    var videoId = null;
-    var match = currentUrl.match(/[?&]v=([^&]+)/) || currentUrl.match(/youtu\.be\/([^?&]+)/);
-    if (match) {
-      videoId = match[1];
+    for (var i = 0; i < patterns.length; i++) {
+      var match = url.match(patterns[i]);
+      if (match) return match[1];
     }
-
-    if (!videoId) {
-      result.error = 'Could not extract YouTube video ID';
-      return result;
-    }
-
-    result.videoInfo = {
-      id: videoId,
-      url: 'https://www.youtube.com/watch?v=' + videoId,
-      thumbnails: {
-        maxres: 'https://img.youtube.com/vi/' + videoId + '/maxresdefault.jpg',
-        hq: 'https://img.youtube.com/vi/' + videoId + '/hqdefault.jpg',
-        default: 'https://img.youtube.com/vi/' + videoId + '/default.jpg'
-      }
-    };
-
-    result.message = 'YouTube video detected. Video ID: ' + videoId + '\n\nClick "Run CD" to attempt stream extraction.';
-    return result;
+    return null;
   }
 
-  // Check for YouTube Shorts
-  if (currentUrl.includes('youtube.com/shorts/')) {
+  // Check for YouTube
+  var youtubeId = extractYouTubeId(currentUrl);
+  if (youtubeId) {
     result.site = 'youtube';
-    var shortsMatch = currentUrl.match(/youtube\.com\/shorts\/([^?&]+)/);
-    if (shortsMatch) {
-      var shortsId = shortsMatch[1];
-      result.videoInfo = {
-        id: shortsId,
-        url: 'https://www.youtube.com/watch?v=' + shortsId,
-        thumbnails: {
-          maxres: 'https://img.youtube.com/vi/' + shortsId + '/maxresdefault.jpg'
-        }
-      };
-      result.message = 'YouTube Short detected. Video ID: ' + shortsId;
-      return result;
-    }
+    result.videoId = youtubeId;
+    result.message = 'YouTube video detected!\n\nVideo ID: ' + youtubeId + '\n\nClick "Run CD" to download video (with audio).';
+    return result;
   }
 
   // Check if direct media URL
   var urlType = classifyUrl(currentUrl);
 
   if (urlType === 'stream') {
-    result.error = 'Streaming manifest detected (.m3u8/.mpd). These are segmented streams that require special handling.';
+    result.error = 'Streaming manifest detected (.m3u8/.mpd). These are segmented streams that cannot be downloaded directly.';
     return result;
   }
 
@@ -124,8 +98,7 @@ function DataCollector(currentUrl) {
       url: currentUrl,
       filename: getFilename(currentUrl),
       type: urlType,
-      extension: getExtension(currentUrl),
-      source: 'direct-url'
+      extension: getExtension(currentUrl)
     });
     result.message = 'Direct ' + urlType + ' file detected: ' + getFilename(currentUrl);
     return result;
@@ -142,19 +115,15 @@ function DataCollector(currentUrl) {
 
   // Unknown page
   result.site = 'unknown';
-  result.message = 'No media detected on this page.\n\n' +
-    'Supported:\n' +
-    '• YouTube videos (youtube.com/watch?v=...)\n' +
-    '• Direct media URLs (.mp4, .mp3, .webm, etc.)\n\n' +
-    'Not supported:\n' +
-    '• Netflix, Spotify, Disney+ (DRM protected)\n' +
-    '• Embedded players without direct URLs';
+  result.message = 'No media detected.\n\nSupported:\n• YouTube (youtube.com/watch?v=...)\n• Direct media URLs (.mp4, .mp3, etc.)';
 
   return result;
 }
 
 /**
- * Run - Download or extract media
+ * Run - Download media
+ * For YouTube: calls background service worker with YouTube.js
+ * For direct URLs: returns download action
  */
 async function Run(data) {
   if (!data) {
@@ -165,242 +134,31 @@ async function Run(data) {
     return { success: false, error: data.error };
   }
 
-  // Handle YouTube
-  if (data.site === 'youtube' && data.videoInfo) {
-    return await handleYouTube(data.videoInfo);
+  // Handle YouTube via background service
+  if (data.site === 'youtube' && data.videoId) {
+    return {
+      success: true,
+      action: 'youtube_download',
+      videoId: data.videoId,
+      type: 'video', // 'video' for video+audio, 'audio' for audio only
+      message: 'Fetching YouTube video...'
+    };
   }
 
   // Handle direct media URLs
   if (data.site === 'direct' && data.candidates && data.candidates.length > 0) {
-    return handleDirectMedia(data.candidates[0]);
-  }
-
-  return {
-    success: false,
-    error: 'No downloadable media found.'
-  };
-}
-
-/**
- * Handle YouTube video extraction
- */
-async function handleYouTube(videoInfo) {
-  var videoId = videoInfo.id;
-
-  try {
-    // Fetch the YouTube page to extract player data
-    var response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error('Failed to fetch YouTube page: ' + response.status);
-    }
-
-    var html = await response.text();
-
-    // Extract ytInitialPlayerResponse
-    var playerMatch = html.match(/var ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-    if (!playerMatch) {
-      // Try alternative pattern
-      playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-    }
-
-    if (!playerMatch) {
-      // Fallback: offer thumbnail download
-      return {
-        success: true,
-        action: 'download',
-        download: {
-          url: videoInfo.thumbnails.maxres,
-          filename: 'youtube-' + videoId + '-thumbnail.jpg',
-          saveAs: true
-        },
-        message: 'Could not extract video streams. Downloading thumbnail instead.\n\nFor full video download, use yt-dlp:\nyt-dlp "https://youtube.com/watch?v=' + videoId + '"',
-        note: 'YouTube stream extraction failed - page structure may have changed'
-      };
-    }
-
-    // Parse player response
-    var playerData;
-    try {
-      playerData = JSON.parse(playerMatch[1]);
-    } catch (e) {
-      throw new Error('Failed to parse player data');
-    }
-
-    // Check for playability
-    var playability = playerData.playabilityStatus;
-    if (playability && playability.status !== 'OK') {
-      var reason = playability.reason || playability.status;
-      return {
-        success: false,
-        error: 'Video not available: ' + reason
-      };
-    }
-
-    // Get video title
-    var title = 'youtube-' + videoId;
-    if (playerData.videoDetails && playerData.videoDetails.title) {
-      title = playerData.videoDetails.title
-        .replace(/[^\w\s-]/g, '')
-        .replace(/\s+/g, '-')
-        .substring(0, 50);
-    }
-
-    // Extract streaming formats
-    var formats = [];
-
-    if (playerData.streamingData) {
-      // Regular formats (video+audio combined)
-      if (playerData.streamingData.formats) {
-        playerData.streamingData.formats.forEach(function(f) {
-          if (f.url) {
-            formats.push({
-              url: f.url,
-              quality: f.qualityLabel || f.quality || 'unknown',
-              mimeType: f.mimeType || '',
-              type: 'combined',
-              hasAudio: true,
-              hasVideo: true
-            });
-          }
-        });
-      }
-
-      // Adaptive formats (separate audio/video)
-      if (playerData.streamingData.adaptiveFormats) {
-        playerData.streamingData.adaptiveFormats.forEach(function(f) {
-          if (f.url) {
-            var isAudio = f.mimeType && f.mimeType.includes('audio');
-            formats.push({
-              url: f.url,
-              quality: f.qualityLabel || f.audioQuality || f.quality || 'unknown',
-              mimeType: f.mimeType || '',
-              bitrate: f.bitrate,
-              type: isAudio ? 'audio' : 'video',
-              hasAudio: isAudio,
-              hasVideo: !isAudio
-            });
-          }
-        });
-      }
-    }
-
-    // Filter for formats with direct URLs (no signature required)
-    var availableFormats = formats.filter(function(f) {
-      return f.url && !f.url.includes('signature') && !f.url.includes('&s=');
-    });
-
-    if (availableFormats.length === 0) {
-      // All formats require signature decryption
-      return {
-        success: true,
-        action: 'download',
-        download: {
-          url: videoInfo.thumbnails.maxres,
-          filename: title + '-thumbnail.jpg',
-          saveAs: true
-        },
-        message: 'Video streams require signature decryption (not available in browser).\n\n' +
-          'Downloading thumbnail instead.\n\n' +
-          'For full video, use yt-dlp:\n' +
-          'yt-dlp -f "bestaudio" --extract-audio --audio-format mp3 "https://youtube.com/watch?v=' + videoId + '"',
-        ytdlpCommand: 'yt-dlp -x --audio-format mp3 "https://youtube.com/watch?v=' + videoId + '"'
-      };
-    }
-
-    // Find best audio format
-    var audioFormats = availableFormats.filter(function(f) {
-      return f.type === 'audio';
-    }).sort(function(a, b) {
-      return (b.bitrate || 0) - (a.bitrate || 0);
-    });
-
-    // Find best combined format
-    var combinedFormats = availableFormats.filter(function(f) {
-      return f.type === 'combined';
-    });
-
-    // Prefer audio-only for MP3 conversion path
-    if (audioFormats.length > 0) {
-      var bestAudio = audioFormats[0];
-      var ext = '.webm';
-      if (bestAudio.mimeType.includes('mp4')) ext = '.m4a';
-
-      return {
-        success: true,
-        action: 'download',
-        download: {
-          url: bestAudio.url,
-          filename: title + ext,
-          saveAs: true
-        },
-        message: 'Downloading audio: ' + title + ext + '\n\nQuality: ' + bestAudio.quality,
-        availableFormats: availableFormats.length,
-        note: 'To convert to MP3, use: ffmpeg -i "' + title + ext + '" "' + title + '.mp3"'
-      };
-    }
-
-    // Fall back to combined format
-    if (combinedFormats.length > 0) {
-      var best = combinedFormats[0];
-      return {
-        success: true,
-        action: 'download',
-        download: {
-          url: best.url,
-          filename: title + '.mp4',
-          saveAs: true
-        },
-        message: 'Downloading video: ' + title + '.mp4\n\nQuality: ' + best.quality,
-        availableFormats: availableFormats.length
-      };
-    }
-
-    // Last resort - any available format
-    var anyFormat = availableFormats[0];
+    var media = data.candidates[0];
     return {
       success: true,
       action: 'download',
       download: {
-        url: anyFormat.url,
-        filename: title + '.mp4',
+        url: media.url,
+        filename: media.filename,
         saveAs: true
       },
-      message: 'Downloading: ' + title
-    };
-
-  } catch (error) {
-    // On any error, offer thumbnail download
-    return {
-      success: true,
-      action: 'download',
-      download: {
-        url: videoInfo.thumbnails.maxres,
-        filename: 'youtube-' + videoId + '-thumbnail.jpg',
-        saveAs: true
-      },
-      message: 'Stream extraction failed: ' + error.message + '\n\nDownloading thumbnail instead.\n\nFor video download, use yt-dlp:\nyt-dlp "https://youtube.com/watch?v=' + videoId + '"',
-      error: error.message
+      message: 'Downloading: ' + media.filename
     };
   }
-}
 
-/**
- * Handle direct media URL download
- */
-function handleDirectMedia(media) {
-  return {
-    success: true,
-    action: 'download',
-    download: {
-      url: media.url,
-      filename: media.filename,
-      saveAs: true
-    },
-    message: 'Downloading: ' + media.filename
-  };
+  return { success: false, error: 'No downloadable media found.' };
 }
