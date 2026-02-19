@@ -1,0 +1,7 @@
+{
+  "name": "realtime-subtitles",
+  "version": "1.0.0",
+  "description": "Real-time English subtitles for tab audio using Deepgram AI. Captures audio from the active tab and displays live transcription as a draggable overlay.",
+  "author": "CD-Driver",
+  "permissions": ["tabCapture", "offscreen"]
+}
