@@ -1,9 +1,7 @@
 {
   "name": "ytdl-cd",
-  "version": "1.1.0",
-  "description": "Downloads YouTube videos using a bundled pure-JS InnerTube extractor. Get Data collects the video ID and your browser's YouTube cookies; Run extracts the stream URL and downloads the file.",
+  "version": "1.2.0",
+  "description": "Downloads YouTube videos. Get Data collects the video ID; Run triggers the built-in downloader with full cipher decryption support.",
   "author": "CD-Driver",
-  "permissions": ["downloads", "cookies"],
-  "useCookies": true,
-  "libs": ["lib.js"]
+  "permissions": ["downloads"]
 }

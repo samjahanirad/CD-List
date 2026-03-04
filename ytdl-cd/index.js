@@ -1,18 +1,12 @@
 /**
  * ytdl-cd
  *
- * Downloads YouTube videos using the bundled pure-JS YTDLCore library.
+ * Downloads YouTube videos via the CD-Driver service worker.
  *
  * Usage:
  *   1. Navigate to a YouTube video page
- *   2. Click "Get Data" — collects the video ID and your YouTube cookies
- *   3. Click "Run CD"  — extracts the stream URL and downloads the file
- *
- * Notes:
- *   - Works for most public YouTube videos without login
- *   - If logged in to YouTube, your session cookies are used automatically
- *     to access age-restricted or member-only content
- *   - Uses a bundled YTDLCore library (lib.js) — no external services needed
+ *   2. Click "Get Data" — collects the video ID
+ *   3. Click "Run CD"  — downloads the video
  */
 
 /**
@@ -96,7 +90,7 @@ function DataCollector(currentUrl, context) {
  * @param {Object} data - Return value from DataCollector()
  * @returns {Promise<Object>} Download action or error object
  */
-async function Run(data) {
+function Run(data) {
   if (!data) {
     return { success: false, error: 'No data. Click "Get Data" first.' };
   }
@@ -109,47 +103,11 @@ async function Run(data) {
     return { success: false, error: 'No video ID collected. Click "Get Data" on a YouTube video page.' };
   }
 
-  try {
-    // YTDLCore is injected by lib.js before this code runs
-    var stream = await YTDLCore.getStreamUrl(data.videoId, 'video', data.cookies);
-
-    // Validate the stream URL before triggering a download.
-    // YouTube CDN URLs with an undecrypted "n" parameter return a 403 HTML
-    // error page which Chrome saves as a text file instead of a video.
-    try {
-      var headRes = await fetch(stream.url, { method: 'HEAD' });
-      var ct = headRes.headers.get('content-type') || '';
-      if (!headRes.ok || (!ct.startsWith('video/') && !ct.startsWith('audio/'))) {
-        throw new Error('URL check: ' + headRes.status + ' ' + (ct || 'unknown content-type'));
-      }
-    } catch (validateErr) {
-      throw new Error('Stream URL invalid (' + validateErr.message + ')');
-    }
-
-    return {
-      success: true,
-      action: 'download',
-      download: {
-        url: stream.url,
-        filename: stream.filename,
-        saveAs: true
-      },
-      message: [
-        'Downloading: ' + stream.title,
-        'Quality: ' + stream.quality,
-        'Format: ' + (stream.mimeType || 'unknown'),
-        'Extracted via: ' + stream.client + ' client'
-      ].join('\n')
-    };
-  } catch (err) {
-    // lib.js extraction failed or URL was invalid — fall back to the
-    // service-worker's built-in YouTube handler which handles cipher decryption.
-    return {
-      success: true,
-      action: 'youtube_download',
-      videoId: data.videoId,
-      type: 'video',
-      message: 'Using built-in downloader.\nReason: ' + err.message
-    };
-  }
+  return {
+    success: true,
+    action: 'youtube_download',
+    videoId: data.videoId,
+    type: 'video',
+    message: 'Fetching stream for video: ' + data.videoId
+  };
 }
