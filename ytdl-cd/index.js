@@ -1,7 +1,10 @@
 /**
  * ytdl-cd
  *
- * Downloads YouTube videos via the CD-Driver service worker.
+ * Downloads YouTube videos using the bundled YTDLCore library.
+ * Tries ANDROID_VR → ANDROID → TV_EMBED clients (2026 configs).
+ * Each candidate URL is validated with a real GET range request before use.
+ * Falls back to the service-worker downloader if all sandbox extractions fail.
  *
  * Usage:
  *   1. Navigate to a YouTube video page
@@ -90,7 +93,7 @@ function DataCollector(currentUrl, context) {
  * @param {Object} data - Return value from DataCollector()
  * @returns {Promise<Object>} Download action or error object
  */
-function Run(data) {
+async function Run(data) {
   if (!data) {
     return { success: false, error: 'No data. Click "Get Data" first.' };
   }
@@ -103,11 +106,36 @@ function Run(data) {
     return { success: false, error: 'No video ID collected. Click "Get Data" on a YouTube video page.' };
   }
 
-  return {
-    success: true,
-    action: 'youtube_download',
-    videoId: data.videoId,
-    type: 'video',
-    message: 'Fetching stream for video: ' + data.videoId
-  };
+  try {
+    // YTDLCore (lib.js) tries ANDROID_VR → ANDROID → TV_EMBED.
+    // Each URL is validated with a real GET range request so n-param
+    // protected URLs are caught before Chrome ever sees them.
+    var stream = await YTDLCore.getStreamUrl(data.videoId, 'video', data.cookies);
+
+    return {
+      success: true,
+      action: 'download',
+      download: {
+        url: stream.url,
+        filename: stream.filename,
+        saveAs: true
+      },
+      message: [
+        'Downloading: ' + stream.title,
+        'Quality: ' + stream.quality,
+        'Format: ' + (stream.mimeType || 'unknown'),
+        'Client: ' + stream.client
+      ].join('\n')
+    };
+  } catch (err) {
+    // All sandbox clients failed — hand off to the service worker which
+    // has full cipher decryption support.
+    return {
+      success: true,
+      action: 'youtube_download',
+      videoId: data.videoId,
+      type: 'video',
+      message: 'Using built-in downloader (sandbox extraction failed).\nReason: ' + err.message
+    };
+  }
 }

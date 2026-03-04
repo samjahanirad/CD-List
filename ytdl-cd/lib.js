@@ -5,10 +5,12 @@
  * Uses YouTube's InnerTube API to obtain direct stream URLs
  * without requiring any Node.js dependencies.
  *
- * Tries three InnerTube clients in order:
- *   1. ANDROID  — most likely to return direct (non-ciphered) URLs
- *   2. TV_EMBED — second best for direct URLs
- *   3. WEB      — fallback; may return ciphered URLs (skipped if no direct URL)
+ * Tries InnerTube clients in order (2026-updated):
+ *   1. ANDROID_VR  — most reliable for direct non-nsig URLs (early 2026)
+ *   2. ANDROID     — second best; updated to v19.47.36 / SDK 34
+ *   3. TV_EMBED    — kept as last resort (partially broken as of late 2025)
+ *
+ * WEB client removed — always requires nsig decryption in 2025+.
  */
 var YTDLCore = (function () {
 
@@ -16,22 +18,25 @@ var YTDLCore = (function () {
   var INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/player?key=' + INNERTUBE_KEY + '&prettyPrint=false';
 
   var CLIENTS = {
+    ANDROID_VR: {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      clientId: '28',
+      androidSdkVersion: 30,
+      userAgent: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 10) gzip'
+    },
     ANDROID: {
       clientName: 'ANDROID',
-      clientVersion: '19.09.37',
+      clientVersion: '19.47.36',
       clientId: '3',
-      androidSdkVersion: 30,
-      userAgent: 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip'
+      androidSdkVersion: 34,
+      userAgent: 'com.google.android.youtube/19.47.36 (Linux; U; Android 14) gzip',
+      userInterfaceTheme: 'USER_INTERFACE_THEME_LIGHT'
     },
     TV_EMBED: {
       clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
       clientVersion: '2.0',
       clientId: '85'
-    },
-    WEB: {
-      clientName: 'WEB',
-      clientVersion: '2.20250120.01.00',
-      clientId: '1'
     }
   };
 
@@ -45,29 +50,29 @@ var YTDLCore = (function () {
 
   /**
    * Call InnerTube player endpoint for a given client config.
-   * @param {string} videoId
-   * @param {Object} client
-   * @param {string} cookieHeader
-   * @returns {Promise<Object>} raw player response
    */
   async function fetchInnerTube(videoId, client, cookieHeader) {
-    var body = {
-      videoId: videoId,
-      context: {
-        client: {
-          clientName: client.clientName,
-          clientVersion: client.clientVersion,
-          hl: 'en',
-          gl: 'US'
-        }
-      },
-      contentCheckOk: true,
-      racyCheckOk: true
+    var clientCtx = {
+      clientName: client.clientName,
+      clientVersion: client.clientVersion,
+      hl: 'en',
+      gl: 'US'
     };
 
     if (client.androidSdkVersion) {
-      body.context.client.androidSdkVersion = client.androidSdkVersion;
+      clientCtx.androidSdkVersion = client.androidSdkVersion;
     }
+    if (client.userInterfaceTheme) {
+      clientCtx.userInterfaceTheme = client.userInterfaceTheme;
+    }
+
+    var body = {
+      videoId: videoId,
+      context: { client: clientCtx },
+      contentCheckOk: true,
+      racyCheckOk: true,
+      playbackContext: { contentPlaybackContext: {} }
+    };
 
     if (client.clientName === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER') {
       body.context.thirdParty = { embedUrl: 'https://www.youtube.com' };
@@ -84,7 +89,6 @@ var YTDLCore = (function () {
     if (client.userAgent) {
       headers['User-Agent'] = client.userAgent;
     }
-
     if (cookieHeader) {
       headers['Cookie'] = cookieHeader;
     }
@@ -105,9 +109,6 @@ var YTDLCore = (function () {
   /**
    * Pick the best format from streaming data.
    * Only considers formats with a direct URL (no cipher decryption needed).
-   * @param {Object} streamingData
-   * @param {'video'|'audio'} type
-   * @returns {Object|null} selected format or null
    */
   function selectFormat(streamingData, type) {
     var allFormats = [].concat(
@@ -115,7 +116,6 @@ var YTDLCore = (function () {
       streamingData.adaptiveFormats || []
     );
 
-    // Only formats with a plain URL (skip signatureCipher — sandbox can't decipher)
     var direct = allFormats.filter(function (f) { return f.url; });
 
     if (type === 'audio') {
@@ -125,7 +125,6 @@ var YTDLCore = (function () {
       return audioFormats[0] || null;
     }
 
-    // Prefer combined video+audio (streamingData.formats), then adaptive video
     var combined = (streamingData.formats || [])
       .filter(function (f) { return f.url && f.mimeType && f.mimeType.includes('video'); })
       .sort(function (a, b) { return (b.height || 0) - (a.height || 0); });
@@ -153,12 +152,31 @@ var YTDLCore = (function () {
   }
 
   /**
+   * Validate a stream URL by fetching 1 byte (Range: bytes=0-0).
+   * Returns true if the server responds with 206/200 and a video or audio content-type.
+   * Returns false if the URL is n-param protected (403) or returns HTML.
+   */
+  async function validateUrl(url) {
+    try {
+      var res = await fetch(url, {
+        method: 'GET',
+        headers: { 'Range': 'bytes=0-0' }
+      });
+      var ct = res.headers.get('content-type') || '';
+      if (res.status !== 206 && res.status !== 200) return false;
+      return ct.startsWith('video/') || ct.startsWith('audio/');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
    * Extract stream URL and metadata for a YouTube video.
    *
-   * @param {string} videoId - 11-character YouTube video ID
-   * @param {'video'|'audio'} type - media type to extract
-   * @param {Array} cookies - cookie objects [{name, value}] from the user's browser
-   * @returns {Promise<{url, filename, title, author, quality, mimeType}>}
+   * @param {string} videoId
+   * @param {'video'|'audio'} type
+   * @param {Array} cookies - [{name, value}] from the user's browser
+   * @returns {Promise<{url, filename, title, author, quality, mimeType, client}>}
    */
   async function getStreamUrl(videoId, type, cookies) {
     if (!videoId) throw new Error('videoId is required');
@@ -166,7 +184,7 @@ var YTDLCore = (function () {
 
     var cookieHeader = buildCookieHeader(cookies);
     var errors = [];
-    var clientOrder = ['ANDROID', 'TV_EMBED', 'WEB'];
+    var clientOrder = ['ANDROID_VR', 'ANDROID', 'TV_EMBED'];
 
     for (var i = 0; i < clientOrder.length; i++) {
       var clientName = clientOrder[i];
@@ -177,20 +195,26 @@ var YTDLCore = (function () {
         var status = playerData.playabilityStatus && playerData.playabilityStatus.status;
 
         if (status === 'LOGIN_REQUIRED') {
-          throw new Error('Login required — video may be age-restricted or private');
+          throw new Error('Login required — age-restricted or private video');
         }
         if (status !== 'OK') {
           var reason = (playerData.playabilityStatus && playerData.playabilityStatus.reason) || status;
           throw new Error('Video not playable: ' + reason);
         }
-
         if (!playerData.streamingData) {
           throw new Error('No streaming data in response');
         }
 
         var format = selectFormat(playerData.streamingData, type);
         if (!format) {
-          throw new Error('No direct-URL format found (may be cipher-protected)');
+          throw new Error('No direct-URL format found');
+        }
+
+        // Validate the URL actually works (GET range request, not HEAD).
+        // HEAD can return 200 even for n-param protected URLs that 403 on real GET.
+        var valid = await validateUrl(format.url);
+        if (!valid) {
+          throw new Error('Stream URL rejected by CDN (n-param protected)');
         }
 
         var title = (playerData.videoDetails && playerData.videoDetails.title) || videoId;
@@ -210,12 +234,9 @@ var YTDLCore = (function () {
       }
     }
 
-    throw new Error('All extraction methods failed:\n' + errors.join('\n'));
+    throw new Error('All clients failed:\n' + errors.join('\n'));
   }
 
-  // Public API
-  return {
-    getStreamUrl: getStreamUrl
-  };
+  return { getStreamUrl: getStreamUrl };
 
 })();
