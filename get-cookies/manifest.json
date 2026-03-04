@@ -1,0 +1,8 @@
+{
+  "name": "get-cookies",
+  "version": "1.0.0",
+  "description": "Export cookies for the current site as cookies.txt (Netscape format). Compatible with curl, wget, yt-dlp, and Python. Nothing is transmitted externally.",
+  "author": "CD-Driver",
+  "permissions": ["downloads", "cookies"],
+  "useCookies": true
+}
