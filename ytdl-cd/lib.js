@@ -8,9 +8,11 @@
  * Tries InnerTube clients in order (2026-updated):
  *   1. ANDROID_VR  — most reliable for direct non-nsig URLs (early 2026)
  *   2. ANDROID     — second best; updated to v19.47.36 / SDK 34
- *   3. TV_EMBED    — kept as last resort (partially broken as of late 2025)
+ *   3. TV_EMBED    — last resort
  *
  * WEB client removed — always requires nsig decryption in 2025+.
+ * URL validation removed — CORS blocks range-GET from sandbox, causing
+ * false negatives even for valid ANDROID_VR URLs. Trust the client.
  */
 var YTDLCore = (function () {
 
@@ -152,25 +154,6 @@ var YTDLCore = (function () {
   }
 
   /**
-   * Validate a stream URL by fetching 1 byte (Range: bytes=0-0).
-   * Returns true if the server responds with 206/200 and a video or audio content-type.
-   * Returns false if the URL is n-param protected (403) or returns HTML.
-   */
-  async function validateUrl(url) {
-    try {
-      var res = await fetch(url, {
-        method: 'GET',
-        headers: { 'Range': 'bytes=0-0' }
-      });
-      var ct = res.headers.get('content-type') || '';
-      if (res.status !== 206 && res.status !== 200) return false;
-      return ct.startsWith('video/') || ct.startsWith('audio/');
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /**
    * Extract stream URL and metadata for a YouTube video.
    *
    * @param {string} videoId
@@ -208,13 +191,6 @@ var YTDLCore = (function () {
         var format = selectFormat(playerData.streamingData, type);
         if (!format) {
           throw new Error('No direct-URL format found');
-        }
-
-        // Validate the URL actually works (GET range request, not HEAD).
-        // HEAD can return 200 even for n-param protected URLs that 403 on real GET.
-        var valid = await validateUrl(format.url);
-        if (!valid) {
-          throw new Error('Stream URL rejected by CDN (n-param protected)');
         }
 
         var title = (playerData.videoDetails && playerData.videoDetails.title) || videoId;
