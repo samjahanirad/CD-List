@@ -113,6 +113,19 @@ async function Run(data) {
     // YTDLCore is injected by lib.js before this code runs
     var stream = await YTDLCore.getStreamUrl(data.videoId, 'video', data.cookies);
 
+    // Validate the stream URL before triggering a download.
+    // YouTube CDN URLs with an undecrypted "n" parameter return a 403 HTML
+    // error page which Chrome saves as a text file instead of a video.
+    try {
+      var headRes = await fetch(stream.url, { method: 'HEAD' });
+      var ct = headRes.headers.get('content-type') || '';
+      if (!headRes.ok || (!ct.startsWith('video/') && !ct.startsWith('audio/'))) {
+        throw new Error('URL check: ' + headRes.status + ' ' + (ct || 'unknown content-type'));
+      }
+    } catch (validateErr) {
+      throw new Error('Stream URL invalid (' + validateErr.message + ')');
+    }
+
     return {
       success: true,
       action: 'download',
@@ -129,14 +142,14 @@ async function Run(data) {
       ].join('\n')
     };
   } catch (err) {
-    // If the sandbox extractor fails (e.g. cipher-protected video),
-    // fall back to the service-worker's built-in YouTube handler.
+    // lib.js extraction failed or URL was invalid — fall back to the
+    // service-worker's built-in YouTube handler which handles cipher decryption.
     return {
       success: true,
       action: 'youtube_download',
       videoId: data.videoId,
       type: 'video',
-      message: 'Pure-JS extraction failed, using built-in downloader.\nReason: ' + err.message
+      message: 'Using built-in downloader.\nReason: ' + err.message
     };
   }
 }
