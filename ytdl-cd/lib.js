@@ -1,23 +1,23 @@
 /**
- * YTDLCore — Pure JavaScript YouTube stream extractor
+ * YTDLCore — Pure JavaScript YouTube stream extractor with nsig decoding
  *
- * Runs entirely in the CD sandbox using fetch().
- * Uses YouTube's InnerTube API to obtain direct stream URLs
- * without requiring any Node.js dependencies.
+ * Runs in the CD sandbox (eval / new Function are allowed here).
  *
- * Tries InnerTube clients in order (2026-updated):
- *   1. ANDROID_VR  — most reliable for direct non-nsig URLs (early 2026)
- *   2. ANDROID     — second best; updated to v19.47.36 / SDK 34
- *   3. TV_EMBED    — last resort
+ * Flow:
+ *   1. Call InnerTube with ANDROID_VR → ANDROID → TV_EMBED (updated 2026 configs)
+ *   2. For each candidate URL: decode the encrypted "n" parameter (nsig)
+ *      by fetching YouTube's player.js and running the decoder function.
+ *   3. Return the decoded, download-ready URL.
  *
- * WEB client removed — always requires nsig decryption in 2025+.
- * URL validation removed — CORS blocks range-GET from sandbox, causing
- * false negatives even for valid ANDROID_VR URLs. Trust the client.
+ * The "n" (nsig) parameter is what caused the 403-as-text-file issue.
+ * All clients return URLs with an encrypted n param that YouTube CDN
+ * rejects unless decoded. player.js is cached for the session.
  */
 var YTDLCore = (function () {
 
-  var INNERTUBE_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
-  var INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/player?key=' + INNERTUBE_KEY + '&prettyPrint=false';
+  /* ── InnerTube config ── */
+  var API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+  var API_URL = 'https://www.youtube.com/youtubei/v1/player?key=' + API_KEY + '&prettyPrint=false';
 
   var CLIENTS = {
     ANDROID_VR: {
@@ -25,7 +25,8 @@ var YTDLCore = (function () {
       clientVersion: '1.60.19',
       clientId: '28',
       androidSdkVersion: 30,
-      userAgent: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 10) gzip'
+      userAgent: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 10) gzip',
+      userInterfaceTheme: 'USER_INTERFACE_THEME_DARK'
     },
     ANDROID: {
       clientName: 'ANDROID',
@@ -42,40 +43,39 @@ var YTDLCore = (function () {
     }
   };
 
-  /**
-   * Convert cookie array [{name, value}] to Cookie header string.
-   */
+  /* ── Player JS cache (one fetch per session) ── */
+  var _playerJs = null;
+
+  /* ── Helpers ── */
+
   function buildCookieHeader(cookies) {
-    if (!Array.isArray(cookies) || cookies.length === 0) return '';
+    if (!Array.isArray(cookies) || !cookies.length) return '';
     return cookies.map(function (c) { return c.name + '=' + c.value; }).join('; ');
   }
 
-  /**
-   * Call InnerTube player endpoint for a given client config.
-   */
+  function escRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /* ── InnerTube fetch ── */
+
   async function fetchInnerTube(videoId, client, cookieHeader) {
-    var clientCtx = {
+    var ctx = {
       clientName: client.clientName,
       clientVersion: client.clientVersion,
       hl: 'en',
       gl: 'US'
     };
-
-    if (client.androidSdkVersion) {
-      clientCtx.androidSdkVersion = client.androidSdkVersion;
-    }
-    if (client.userInterfaceTheme) {
-      clientCtx.userInterfaceTheme = client.userInterfaceTheme;
-    }
+    if (client.androidSdkVersion) ctx.androidSdkVersion = client.androidSdkVersion;
+    if (client.userInterfaceTheme) ctx.userInterfaceTheme = client.userInterfaceTheme;
 
     var body = {
       videoId: videoId,
-      context: { client: clientCtx },
+      context: { client: ctx },
+      playbackContext: { contentPlaybackContext: {} },
       contentCheckOk: true,
-      racyCheckOk: true,
-      playbackContext: { contentPlaybackContext: {} }
+      racyCheckOk: true
     };
-
     if (client.clientName === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER') {
       body.context.thirdParty = { embedUrl: 'https://www.youtube.com' };
     }
@@ -87,62 +87,48 @@ var YTDLCore = (function () {
       'Origin': 'https://www.youtube.com',
       'Referer': 'https://www.youtube.com/'
     };
+    if (client.userAgent) headers['User-Agent'] = client.userAgent;
+    if (cookieHeader) headers['Cookie'] = cookieHeader;
 
-    if (client.userAgent) {
-      headers['User-Agent'] = client.userAgent;
-    }
-    if (cookieHeader) {
-      headers['Cookie'] = cookieHeader;
-    }
-
-    var response = await fetch(INNERTUBE_URL, {
+    var res = await fetch(API_URL, {
       method: 'POST',
       headers: headers,
       body: JSON.stringify(body)
     });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
 
-    if (!response.ok) {
-      throw new Error('InnerTube ' + client.clientName + ' HTTP ' + response.status);
+    var data = await res.json();
+    var status = data.playabilityStatus && data.playabilityStatus.status;
+    if (status === 'LOGIN_REQUIRED') throw new Error('Login required');
+    if (status !== 'OK') {
+      throw new Error('Not playable: ' + ((data.playabilityStatus && data.playabilityStatus.reason) || status));
     }
-
-    return response.json();
+    if (!data.streamingData) throw new Error('No streaming data');
+    return data;
   }
 
-  /**
-   * Pick the best format from streaming data.
-   * Only considers formats with a direct URL (no cipher decryption needed).
-   */
-  function selectFormat(streamingData, type) {
-    var allFormats = [].concat(
-      streamingData.formats || [],
-      streamingData.adaptiveFormats || []
-    );
+  /* ── Format selection ── */
 
-    var direct = allFormats.filter(function (f) { return f.url; });
+  function selectFormat(streamingData, type) {
+    var all = [].concat(streamingData.formats || [], streamingData.adaptiveFormats || []);
+    var direct = all.filter(function (f) { return f.url; });
 
     if (type === 'audio') {
-      var audioFormats = direct
+      return direct
         .filter(function (f) { return f.mimeType && f.mimeType.startsWith('audio/'); })
-        .sort(function (a, b) { return (b.bitrate || 0) - (a.bitrate || 0); });
-      return audioFormats[0] || null;
+        .sort(function (a, b) { return (b.bitrate || 0) - (a.bitrate || 0); })[0] || null;
     }
 
     var combined = (streamingData.formats || [])
       .filter(function (f) { return f.url && f.mimeType && f.mimeType.includes('video'); })
       .sort(function (a, b) { return (b.height || 0) - (a.height || 0); });
+    if (combined.length) return combined[0];
 
-    if (combined.length > 0) return combined[0];
-
-    var adaptive = (streamingData.adaptiveFormats || [])
+    return (streamingData.adaptiveFormats || [])
       .filter(function (f) { return f.url && f.mimeType && f.mimeType.startsWith('video/'); })
-      .sort(function (a, b) { return (b.height || 0) - (a.height || 0); });
-
-    return adaptive[0] || null;
+      .sort(function (a, b) { return (b.height || 0) - (a.height || 0); })[0] || null;
   }
 
-  /**
-   * Build a safe filename from the video title.
-   */
   function buildFilename(playerData, format) {
     var title = (playerData.videoDetails && playerData.videoDetails.title) || 'video';
     var safe = title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').substring(0, 80);
@@ -153,12 +139,175 @@ var YTDLCore = (function () {
     return safe + ext;
   }
 
+  /* ── nsig (n-parameter) decoding ── */
+
   /**
-   * Extract stream URL and metadata for a YouTube video.
+   * Fetch and cache YouTube's player.js.
+   * We get its URL from the YouTube watch page HTML.
+   */
+  async function getPlayerJs(videoId) {
+    if (_playerJs) return _playerJs;
+
+    var res = await fetch('https://www.youtube.com/watch?v=' + videoId);
+    if (!res.ok) throw new Error('YouTube page HTTP ' + res.status);
+    var html = await res.text();
+
+    var m = html.match(/\/s\/player\/([a-zA-Z0-9_-]+)\/player_ias\.vflset\/[a-zA-Z_-]+\/base\.js/);
+    if (!m) throw new Error('player.js URL not found in page');
+
+    var jsRes = await fetch('https://www.youtube.com' + m[0]);
+    if (!jsRes.ok) throw new Error('player.js HTTP ' + jsRes.status);
+
+    _playerJs = await jsRes.text();
+    return _playerJs;
+  }
+
+  /**
+   * Extract the nsig decoder function body from player.js.
+   * YouTube references it as: .get("n"))&&(b=ARRAY[IDX]||(ARRAY)[
+   * or the simpler:           .get("n"))&&(b=FUNCNAME(b)
+   */
+  function findNsigFuncBody(playerJs) {
+    // Pattern A: array reference — .get("n"))&&(b=ARR[IDX]||(ARR)[
+    var mA = playerJs.match(/\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]{1,4})\[(\d+)\](?:\|\|\1\[)?/);
+    if (mA) {
+      var arrName = mA[1], idx = parseInt(mA[2]);
+      var arrDef = playerJs.match(new RegExp(
+        'var\\s+' + escRe(arrName) + '\\s*=\\s*\\[([^\\]]+)\\]'
+      ));
+      if (arrDef) {
+        var fnName = arrDef[1].split(',')[idx];
+        if (fnName) {
+          fnName = fnName.trim();
+          var body = extractFuncByName(playerJs, fnName);
+          if (body) return body;
+        }
+      }
+    }
+
+    // Pattern B: direct call — .get("n"))&&(b=FN(b)
+    var mB = playerJs.match(/\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]{1,4})\(b\)/);
+    if (mB) {
+      var body = extractFuncByName(playerJs, mB[1]);
+      if (body) return body;
+    }
+
+    // Pattern C: looser array pattern
+    var mC = playerJs.match(/\("n"\)\)&&\(b=([a-zA-Z0-9$]{1,4})\[/);
+    if (mC) {
+      var arrName2 = mC[1];
+      var arrDef2 = playerJs.match(new RegExp(
+        'var\\s+' + escRe(arrName2) + '\\s*=\\s*\\[([^\\]]+)\\]'
+      ));
+      if (arrDef2) {
+        var fnName2 = arrDef2[1].split(',')[0];
+        if (fnName2) {
+          var body = extractFuncByName(playerJs, fnName2.trim());
+          if (body) return body;
+        }
+      }
+    }
+
+    throw new Error('nsig function reference not found in player.js');
+  }
+
+  /**
+   * Extract a function expression or declaration by name.
+   * Returns a string like "function(a){...}" suitable for new Function().
+   */
+  function extractFuncByName(playerJs, name) {
+    // Try: var NAME=function(a){...}
+    var i1 = playerJs.indexOf('var ' + name + '=function(');
+    if (i1 >= 0) {
+      var fnStart = playerJs.indexOf('function(', i1);
+      return extractBalancedFunc(playerJs, fnStart);
+    }
+
+    // Try: NAME=function(a){...}  (assignment without var)
+    var i2 = playerJs.indexOf(name + '=function(');
+    if (i2 >= 0) {
+      var fnStart2 = playerJs.indexOf('function(', i2);
+      return extractBalancedFunc(playerJs, fnStart2);
+    }
+
+    // Try: function NAME(a){...}
+    var i3 = playerJs.indexOf('function ' + name + '(');
+    if (i3 >= 0) {
+      return extractBalancedFunc(playerJs, i3);
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract a complete function (balanced braces) starting at `start`.
+   * Handles strings and nested braces.
+   */
+  function extractBalancedFunc(playerJs, start) {
+    var braceStart = playerJs.indexOf('{', start);
+    if (braceStart < 0) return null;
+
+    var depth = 0, inStr = false, strCh = '', i = braceStart;
+    while (i < playerJs.length) {
+      var c = playerJs[i];
+      if (inStr) {
+        if (c === strCh && playerJs[i - 1] !== '\\') inStr = false;
+      } else if (c === '"' || c === "'" || c === '`') {
+        inStr = true; strCh = c;
+      } else if (c === '{') {
+        depth++;
+      } else if (c === '}') {
+        depth--;
+        if (depth === 0) return playerJs.substring(start, i + 1);
+      }
+      i++;
+    }
+    return null;
+  }
+
+  /**
+   * Decode the encrypted "n" parameter in a YouTube stream URL.
+   * Fetches player.js (once per session), extracts the nsig function,
+   * runs it via new Function(), and returns the URL with n replaced.
+   */
+  async function decodeNParam(url, videoId) {
+    var parsed;
+    try { parsed = new URL(url); } catch (e) { return url; }
+
+    var n = parsed.searchParams.get('n');
+    if (!n) return url; // No n param — URL is already clean
+
+    try {
+      var playerJs = await getPlayerJs(videoId);
+      var funcBody = findNsigFuncBody(playerJs);
+
+      // Run the nsig decoder. new Function() is allowed in the sandbox.
+      // The nsig function is self-contained (all helpers defined inline).
+      var decoderFn = new Function('return (' + funcBody + ')')();
+      var decoded = decoderFn(n);
+
+      if (typeof decoded !== 'string' || !decoded) {
+        throw new Error('decoder returned empty/non-string: ' + decoded);
+      }
+
+      parsed.searchParams.set('n', decoded);
+      return parsed.toString();
+    } catch (e) {
+      // If nsig decoding fails, return original URL.
+      // The download will likely fail too, triggering youtube_download fallback.
+      console.warn('nsig decode failed:', e.message);
+      return url;
+    }
+  }
+
+  /* ── Public API ── */
+
+  /**
+   * Extract a download-ready stream URL for a YouTube video.
    *
    * @param {string} videoId
    * @param {'video'|'audio'} type
-   * @param {Array} cookies - [{name, value}] from the user's browser
+   * @param {Array} cookies — [{name, value}] (used if available)
    * @returns {Promise<{url, filename, title, author, quality, mimeType, client}>}
    */
   async function getStreamUrl(videoId, type, cookies) {
@@ -175,29 +324,17 @@ var YTDLCore = (function () {
 
       try {
         var playerData = await fetchInnerTube(videoId, client, cookieHeader);
-        var status = playerData.playabilityStatus && playerData.playabilityStatus.status;
-
-        if (status === 'LOGIN_REQUIRED') {
-          throw new Error('Login required — age-restricted or private video');
-        }
-        if (status !== 'OK') {
-          var reason = (playerData.playabilityStatus && playerData.playabilityStatus.reason) || status;
-          throw new Error('Video not playable: ' + reason);
-        }
-        if (!playerData.streamingData) {
-          throw new Error('No streaming data in response');
-        }
-
         var format = selectFormat(playerData.streamingData, type);
-        if (!format) {
-          throw new Error('No direct-URL format found');
-        }
+        if (!format) throw new Error('No direct-URL format found');
+
+        // Decode the n (nsig) parameter so the CDN accepts the URL
+        var url = await decodeNParam(format.url, videoId);
 
         var title = (playerData.videoDetails && playerData.videoDetails.title) || videoId;
         var author = (playerData.videoDetails && playerData.videoDetails.author) || '';
 
         return {
-          url: format.url,
+          url: url,
           filename: buildFilename(playerData, format),
           title: title,
           author: author,
