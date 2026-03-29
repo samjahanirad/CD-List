@@ -1,7 +1,0 @@
-{
-  "name": "media-downloader",
-  "version": "3.0.0",
-  "description": "Download YouTube videos and direct media files. Uses YouTube.js for signature decryption.",
-  "author": "CD-Driver",
-  "permissions": ["downloads"]
-}
