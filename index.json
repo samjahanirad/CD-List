@@ -6,37 +6,5 @@
     "description": "Download video thumbnails from YouTube, Vimeo, and Dailymotion.",
     "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/thumbnail-downloader/index.js",
     "tags": ["youtube", "vimeo", "thumbnail", "download"]
-  },
-  {
-    "id": "get-cookies",
-    "name": "Get Cookies",
-    "version": "1.0.0",
-    "description": "Export cookies for the current site as cookies.txt (Netscape format). Compatible with curl, wget, yt-dlp.",
-    "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/get-cookies/index.js",
-    "tags": ["cookies", "export"]
-  },
-  {
-    "id": "media-downloader",
-    "name": "Media Downloader",
-    "version": "3.0.0",
-    "description": "Download YouTube videos and direct media files. Uses YouTube.js for signature decryption.",
-    "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/media-downloader/index.js",
-    "tags": ["youtube", "video", "download", "media"]
-  },
-  {
-    "id": "realtime-subtitles",
-    "name": "Realtime Subtitles",
-    "version": "1.0.0",
-    "description": "Real-time English subtitles for tab audio using Deepgram AI.",
-    "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/realtime-subtitles/index.js",
-    "tags": ["subtitles", "ai", "accessibility"]
-  },
-  {
-    "id": "ytdl-cd",
-    "name": "YouTube Downloader",
-    "version": "1.5.0",
-    "description": "Downloads YouTube videos with full nsig decoding. Tries multiple InnerTube clients.",
-    "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/ytdl-cd/index.js",
-    "tags": ["youtube", "video", "download"]
   }
 ]
