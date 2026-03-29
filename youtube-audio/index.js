@@ -26,33 +26,44 @@ async function DataCollector(currentUrl, context) {
   const sd = pr.streamingData;
   if (!sd) throw new Error("No streamingData in player response. Video may be unavailable.");
 
-  // ── Diagnostic: report what streamingData actually contains ─────────────────
-  // This tells us whether YouTube is using DASH manifest, SABR, or direct URLs.
-  const sdKeys = Object.keys(sd).join(", ");
-  const adaptiveFormats = sd.adaptiveFormats || [];
-  const audioFormat = pickAudioFormat(adaptiveFormats);
+  // ── 1. Try audio-only adaptive formats (best: no video, smaller file) ───────
+  let audioFormat = pickAudioFormat(sd.adaptiveFormats || []);
+  let isCombined  = false;
 
-  if (!audioFormat) {
-    throw new Error(`No audio format found. streamingData keys: ${sdKeys}`);
+  if (audioFormat && !hasUrl(audioFormat)) {
+    // YouTube SABR protocol: adaptive formats have metadata but no URLs.
+    // Fall through to combined formats below.
+    audioFormat = null;
   }
 
-  if (!hasUrl(audioFormat)) {
-    // The format exists but has no URL — YouTube is using a manifest or SABR.
-    // Report full picture so we know which path to implement next.
-    const formatKeys = Object.keys(audioFormat).join(", ");
-    const hasDash = !!sd.dashManifestUrl;
-    const hasHls  = !!sd.hlsManifestUrl;
-    const hasSabr = !!sd.serverAbrStreamingUrl;
+  // ── 2. Fall back to combined audio+video streams (legacy MP4s) ───────────────
+  // YouTube still serves these as direct URLs for backward compatibility.
+  // itag 22 = 720p MP4 (H.264 + AAC ~192kbps), itag 18 = 360p MP4 (AAC ~96kbps)
+  if (!audioFormat) {
+    const combined = sd.formats || [];
+    const combinedFormat = [22, 18]
+      .map((itag) => combined.find((f) => f.itag === itag))
+      .find((f) => f && hasUrl(f));
+
+    if (combinedFormat) {
+      audioFormat = combinedFormat;
+      isCombined  = true;
+    }
+  }
+
+  if (!audioFormat) {
+    const sdKeys = Object.keys(sd).join(", ");
     throw new Error(
-      `Audio format has no URL. streamingData keys: ${sdKeys}. ` +
-      `dashManifestUrl=${hasDash}, hlsManifestUrl=${hasHls}, serverAbrStreamingUrl=${hasSabr}. ` +
-      `Format keys: ${formatKeys}`
+      `No downloadable stream found. YouTube is using SABR streaming for all formats. ` +
+      `streamingData keys: ${sdKeys}`
     );
   }
 
   const audioUrl = await resolveStreamUrl(audioFormat);
+
+  // Combined streams are MP4 (video+audio). Audio-only adaptive are m4a/webm.
   const mimeType = audioFormat.mimeType || "";
-  const ext = mimeType.includes("webm") ? "webm" : "m4a";
+  const ext = isCombined ? "mp4" : (mimeType.includes("webm") ? "webm" : "m4a");
 
   return {
     title,
@@ -60,6 +71,7 @@ async function DataCollector(currentUrl, context) {
     filename: `${title}.${ext}`,
     itag: audioFormat.itag,
     mimeType,
+    isCombined,
   };
 }
 
@@ -139,6 +151,8 @@ function Run(data) {
       url: data.audioUrl,
       filename: data.filename,
     },
-    message: `Downloading: ${data.filename}`,
+    message: data.isCombined
+      ? `Downloading: ${data.filename} (audio+video — SABR stream, no audio-only available)`
+      : `Downloading: ${data.filename}`,
   };
 }
