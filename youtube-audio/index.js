@@ -112,11 +112,24 @@ async function resolveStreamUrl(audioFormat) {
     return r.text();
   });
 
-  const fnNameMatch = js.match(
-    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
-  );
-  if (!fnNameMatch) throw new Error("Cannot locate cipher function in player script.");
-  const fnName = fnNameMatch[1];
+  // Try multiple patterns — YouTube changes the player regularly.
+  // Listed from most specific (call-site) to most general (structural).
+  const fnNamePatterns = [
+    // Call-site: c&&d.set(...,encodeURIComponent(Xxa(...
+    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/,
+    // Call-site: permissive variable names
+    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(/,
+    // Structural: function that splits on "", transforms, and joins — always present
+    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-z]\)\{[a-z]\s*=\s*[a-z]\.split\(""\)[^}]+return [a-z]\.join\(""\)\}/,
+    // Structural: alternate spacing
+    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-z]\)\{[a-z]=[a-z]\.split\(""\)[^}]*return [a-z]\.join\(""\)\}/,
+  ];
+  let fnName = null;
+  for (const pattern of fnNamePatterns) {
+    const m = js.match(pattern);
+    if (m) { fnName = m[1]; break; }
+  }
+  if (!fnName) throw new Error("Cannot locate cipher function in player script. Player may have changed.");
 
   const escaped = fnName.replace(/[$]/g, "\\$");
   const fnMatch = js.match(new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}"));
