@@ -6,51 +6,55 @@ async function DataCollector(currentUrl, context) {
     throw new Error("Open a YouTube video page first.");
   }
 
-  const urlVideoId = new URLSearchParams(currentUrl.split("?")[1] || "").get("v");
-  const pr = window.ytInitialPlayerResponse;
-  if (!pr) throw new Error("YouTube player data not found. Try refreshing the page.");
+  // Always read video ID from the URL — ytInitialPlayerResponse can be stale
+  // after SPA navigation (YouTube changes the URL without a full page reload).
+  const videoId = new URLSearchParams(currentUrl.split("?")[1] || "").get("v");
+  if (!videoId) throw new Error("Cannot find video ID in the URL.");
 
-  const prVideoId = pr.videoDetails?.videoId;
-  if (urlVideoId && prVideoId && urlVideoId !== prVideoId) {
-    throw new Error("Player data is stale. Please refresh the page.");
+  // Try ytInitialPlayerResponse only when it matches the current video
+  const pr = window.ytInitialPlayerResponse;
+  const prMatchesCurrent = pr?.videoDetails?.videoId === videoId;
+
+  let title = "youtube-audio";
+  let audioFormat = null;
+
+  if (prMatchesCurrent) {
+    title = (pr.videoDetails?.title || title)
+      .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
+    audioFormat = pickAudioFormat(pr.streamingData?.adaptiveFormats || []);
   }
 
-  const videoId = prVideoId || urlVideoId;
-  if (!videoId) throw new Error("Cannot determine video ID.");
-
-  const title = (pr.videoDetails?.title || "youtube-audio")
-    .replace(/[<>:"/\\|?*]/g, "")
-    .trim()
-    .slice(0, 100);
-
-  // ── Try ytInitialPlayerResponse first ──────────────────────────────────────
-  let audioFormat = pickAudioFormat(pr.streamingData?.adaptiveFormats || []);
-
-  // If the format has no resolvable URL, YouTube withheld stream URLs from the
-  // initial page payload. Fall back to a fresh InnerTube API call.
+  // If ytInitialPlayerResponse is stale, missing, or has no usable URL,
+  // fetch fresh data from YouTube's own InnerTube API (cookies sent automatically).
   if (!audioFormat || !hasUrl(audioFormat)) {
     const fresh = await fetchInnerTubePlayer(videoId);
-    // Diagnostic: log the full response structure so we can debug
     const sd = fresh.streamingData;
-    const status = fresh.playabilityStatus?.status || "unknown";
-    const reason = fresh.playabilityStatus?.reason || "";
-    const adaptiveCount = sd?.adaptiveFormats?.length ?? "missing";
-    const formatsCount = sd?.formats?.length ?? "missing";
-    const sdKeys = sd ? Object.keys(sd).join(", ") : "streamingData missing";
+
+    // Pull title from fresh response if we didn't get it above
+    if (!prMatchesCurrent) {
+      title = (fresh.videoDetails?.title || title)
+        .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
+    }
 
     audioFormat = pickAudioFormat(sd?.adaptiveFormats || [])
                || pickAudioFormat(sd?.formats || []);
 
     if (!audioFormat) {
+      const status = fresh.playabilityStatus?.status || "unknown";
+      const reason = fresh.playabilityStatus?.reason || "";
+      const adaptiveCount = sd?.adaptiveFormats?.length ?? "none";
+      const sdKeys = sd ? Object.keys(sd).join(", ") : "streamingData absent";
       throw new Error(
-        `No audio stream found. playabilityStatus=${status}${reason ? " ("+reason+")" : ""}. ` +
-        `adaptiveFormats=${adaptiveCount}, formats=${formatsCount}. ` +
-        `streamingData keys: ${sdKeys}`
+        `No audio stream found. status=${status}${reason ? " ("+reason+")" : ""}` +
+        `, adaptiveFormats=${adaptiveCount}, streamingData keys: ${sdKeys}`
       );
     }
+
     if (!hasUrl(audioFormat)) {
-      const keys = Object.keys(audioFormat).join(", ");
-      throw new Error(`Stream URL still missing after InnerTube refresh. Keys: ${keys}`);
+      throw new Error(
+        `Stream URL still missing after InnerTube refresh. ` +
+        `Format keys: ${Object.keys(audioFormat).join(", ")}`
+      );
     }
   }
 
@@ -70,8 +74,7 @@ async function DataCollector(currentUrl, context) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function pickAudioFormat(formats) {
-  // Prefer high-quality AAC (.m4a), fall back to Opus (.webm)
-  // 141 = AAC 256kbps, 140 = AAC 128kbps, 251/250/249 = Opus
+  // 141 = AAC 256kbps (.m4a), 140 = AAC 128kbps (.m4a), 251/250/249 = Opus (.webm)
   return (
     [141, 140, 251, 250, 249]
       .map((itag) => formats.find((f) => f.itag === itag))
@@ -85,24 +88,32 @@ function hasUrl(format) {
 }
 
 // Call YouTube's own InnerTube player API from the page context.
-// Cookies are included automatically — same as any fetch() on youtube.com.
+// Runs on youtube.com so the browser includes session cookies automatically.
 async function fetchInnerTubePlayer(videoId) {
   const cfg = window.yt?.config_ || {};
   const apiKey = cfg.INNERTUBE_API_KEY || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const clientName    = cfg.INNERTUBE_CLIENT_NAME    || "WEB";
+  const clientVersion = cfg.INNERTUBE_CLIENT_VERSION || "2.20240101";
+  const visitorData   = cfg.VISITOR_DATA             || "";
 
   const res = await fetch(
     `/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-YouTube-Client-Name":    String(cfg.INNERTUBE_CONTEXT_CLIENT_NAME || "1"),
+        "X-YouTube-Client-Version": clientVersion,
+      },
       body: JSON.stringify({
         videoId,
         context: {
           client: {
-            clientName: cfg.INNERTUBE_CLIENT_NAME || "WEB",
-            clientVersion: cfg.INNERTUBE_CLIENT_VERSION || "2.20240101",
-            hl: cfg.HL || "en",
-            gl: cfg.GL || "US",
+            clientName,
+            clientVersion,
+            hl:          cfg.HL          || "en",
+            gl:          cfg.GL          || "US",
+            visitorData,
           },
         },
       }),
@@ -113,30 +124,27 @@ async function fetchInnerTubePlayer(videoId) {
   return res.json();
 }
 
-// Resolve a format entry to a plain URL, decrypting signatureCipher if needed.
+// Resolve a format entry to a usable URL, decrypting signatureCipher if present.
 async function resolveStreamUrl(audioFormat) {
   if (audioFormat.url) return audioFormat.url;
 
   const cipherStr = audioFormat.signatureCipher || audioFormat.cipher;
   const p = new URLSearchParams(cipherStr);
-  const encSig  = p.get("s");
-  const sigParam = p.get("sp") || "sig";
-  const baseUrl  = p.get("url");
+  const encSig   = p.get("s");
+  const sigParam  = p.get("sp") || "sig";
+  const baseUrl   = p.get("url");
   if (!encSig || !baseUrl) throw new Error("Malformed cipher in stream data.");
 
-  // Find base.js already loaded by the page
   const playerSrc = Array.from(document.querySelectorAll("script[src]"))
     .map((s) => s.src)
     .find((src) => src.includes("base.js"));
   if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
 
-  // Fetch base.js — browser sends YouTube cookies automatically
   const js = await fetch(playerSrc).then((r) => {
     if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
     return r.text();
   });
 
-  // Find cipher function name
   const fnNameMatch = js.match(
     /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
   );
