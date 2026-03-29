@@ -6,56 +6,48 @@ async function DataCollector(currentUrl, context) {
     throw new Error("Open a YouTube video page first.");
   }
 
-  // Always read video ID from the URL — ytInitialPlayerResponse can be stale
-  // after SPA navigation (YouTube changes the URL without a full page reload).
   const videoId = new URLSearchParams(currentUrl.split("?")[1] || "").get("v");
   if (!videoId) throw new Error("Cannot find video ID in the URL.");
 
-  // Try ytInitialPlayerResponse only when it matches the current video
+  // ytInitialPlayerResponse is only valid when it matches the current URL video.
+  // YouTube SPA navigation changes the URL but not this global.
   const pr = window.ytInitialPlayerResponse;
   const prMatchesCurrent = pr?.videoDetails?.videoId === videoId;
 
-  let title = "youtube-audio";
-  let audioFormat = null;
-
-  if (prMatchesCurrent) {
-    title = (pr.videoDetails?.title || title)
-      .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
-    audioFormat = pickAudioFormat(pr.streamingData?.adaptiveFormats || []);
+  if (!prMatchesCurrent) {
+    throw new Error(
+      "Player data is for a different video. Please do a full page refresh (Cmd+Shift+R / Ctrl+Shift+R) on this video."
+    );
   }
 
-  // If ytInitialPlayerResponse is stale, missing, or has no usable URL,
-  // fetch fresh data from YouTube's own InnerTube API (cookies sent automatically).
-  if (!audioFormat || !hasUrl(audioFormat)) {
-    const fresh = await fetchInnerTubePlayer(videoId);
-    const sd = fresh.streamingData;
+  const title = (pr.videoDetails?.title || "youtube-audio")
+    .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
 
-    // Pull title from fresh response if we didn't get it above
-    if (!prMatchesCurrent) {
-      title = (fresh.videoDetails?.title || title)
-        .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
-    }
+  const sd = pr.streamingData;
+  if (!sd) throw new Error("No streamingData in player response. Video may be unavailable.");
 
-    audioFormat = pickAudioFormat(sd?.adaptiveFormats || [])
-               || pickAudioFormat(sd?.formats || []);
+  // ── Diagnostic: report what streamingData actually contains ─────────────────
+  // This tells us whether YouTube is using DASH manifest, SABR, or direct URLs.
+  const sdKeys = Object.keys(sd).join(", ");
+  const adaptiveFormats = sd.adaptiveFormats || [];
+  const audioFormat = pickAudioFormat(adaptiveFormats);
 
-    if (!audioFormat) {
-      const status = fresh.playabilityStatus?.status || "unknown";
-      const reason = fresh.playabilityStatus?.reason || "";
-      const adaptiveCount = sd?.adaptiveFormats?.length ?? "none";
-      const sdKeys = sd ? Object.keys(sd).join(", ") : "streamingData absent";
-      throw new Error(
-        `No audio stream found. status=${status}${reason ? " ("+reason+")" : ""}` +
-        `, adaptiveFormats=${adaptiveCount}, streamingData keys: ${sdKeys}`
-      );
-    }
+  if (!audioFormat) {
+    throw new Error(`No audio format found. streamingData keys: ${sdKeys}`);
+  }
 
-    if (!hasUrl(audioFormat)) {
-      throw new Error(
-        `Stream URL still missing after InnerTube refresh. ` +
-        `Format keys: ${Object.keys(audioFormat).join(", ")}`
-      );
-    }
+  if (!hasUrl(audioFormat)) {
+    // The format exists but has no URL — YouTube is using a manifest or SABR.
+    // Report full picture so we know which path to implement next.
+    const formatKeys = Object.keys(audioFormat).join(", ");
+    const hasDash = !!sd.dashManifestUrl;
+    const hasHls  = !!sd.hlsManifestUrl;
+    const hasSabr = !!sd.serverAbrStreamingUrl;
+    throw new Error(
+      `Audio format has no URL. streamingData keys: ${sdKeys}. ` +
+      `dashManifestUrl=${hasDash}, hlsManifestUrl=${hasHls}, serverAbrStreamingUrl=${hasSabr}. ` +
+      `Format keys: ${formatKeys}`
+    );
   }
 
   const audioUrl = await resolveStreamUrl(audioFormat);
@@ -85,84 +77,6 @@ function pickAudioFormat(formats) {
 
 function hasUrl(format) {
   return !!(format.url || format.signatureCipher || format.cipher);
-}
-
-// Call YouTube's own InnerTube player API from the page context.
-// Runs on youtube.com so the browser includes session cookies automatically.
-// Tries multiple client types in order — YouTube restricts which clients
-// return usable stream URLs depending on the video.
-async function fetchInnerTubePlayer(videoId) {
-  const cfg = window.yt?.config_ || {};
-  const apiKey      = cfg.INNERTUBE_API_KEY          || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-  const visitorData = cfg.VISITOR_DATA               || "";
-  const hl          = cfg.HL                         || "en";
-  const gl          = cfg.GL                         || "US";
-
-  // Client definitions to try in order.
-  // TVHTML5 often bypasses restrictions that block WEB client responses.
-  const clients = [
-    {
-      clientName: "TVHTML5",
-      clientVersion: "7.20240101",
-      clientNameId: "7",
-    },
-    {
-      clientName: cfg.INNERTUBE_CLIENT_NAME || "WEB",
-      clientVersion: cfg.INNERTUBE_CLIENT_VERSION || "2.20240101",
-      clientNameId: String(cfg.INNERTUBE_CONTEXT_CLIENT_NAME || "1"),
-    },
-  ];
-
-  let lastError = "All InnerTube client types returned UNPLAYABLE.";
-
-  for (const client of clients) {
-    const res = await fetch(
-      `/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-YouTube-Client-Name":    client.clientNameId,
-          "X-YouTube-Client-Version": client.clientVersion,
-        },
-        body: JSON.stringify({
-          videoId,
-          // Required by YouTube to treat this as a legitimate player request
-          racyCheckOk:    true,
-          contentCheckOk: true,
-          context: {
-            client: {
-              clientName:    client.clientName,
-              clientVersion: client.clientVersion,
-              hl,
-              gl,
-              visitorData,
-            },
-          },
-          playbackContext: {
-            contentPlaybackContext: {
-              currentUrl: `/watch?v=${videoId}`,
-              html5Preference: "HTML5_PREF_WANTS",
-            },
-          },
-        }),
-      }
-    );
-
-    if (!res.ok) {
-      lastError = `InnerTube API HTTP ${res.status} with client ${client.clientName}`;
-      continue;
-    }
-
-    const data = await res.json();
-    if (data.playabilityStatus?.status === "OK") return data;
-
-    lastError =
-      `Client ${client.clientName}: status=${data.playabilityStatus?.status}` +
-      (data.playabilityStatus?.reason ? ` (${data.playabilityStatus.reason})` : "");
-  }
-
-  throw new Error(lastError);
 }
 
 // Resolve a format entry to a usable URL, decrypting signatureCipher if present.
