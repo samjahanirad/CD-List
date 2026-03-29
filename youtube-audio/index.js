@@ -89,39 +89,80 @@ function hasUrl(format) {
 
 // Call YouTube's own InnerTube player API from the page context.
 // Runs on youtube.com so the browser includes session cookies automatically.
+// Tries multiple client types in order — YouTube restricts which clients
+// return usable stream URLs depending on the video.
 async function fetchInnerTubePlayer(videoId) {
   const cfg = window.yt?.config_ || {};
-  const apiKey = cfg.INNERTUBE_API_KEY || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-  const clientName    = cfg.INNERTUBE_CLIENT_NAME    || "WEB";
-  const clientVersion = cfg.INNERTUBE_CLIENT_VERSION || "2.20240101";
-  const visitorData   = cfg.VISITOR_DATA             || "";
+  const apiKey      = cfg.INNERTUBE_API_KEY          || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  const visitorData = cfg.VISITOR_DATA               || "";
+  const hl          = cfg.HL                         || "en";
+  const gl          = cfg.GL                         || "US";
 
-  const res = await fetch(
-    `/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
+  // Client definitions to try in order.
+  // TVHTML5 often bypasses restrictions that block WEB client responses.
+  const clients = [
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-YouTube-Client-Name":    String(cfg.INNERTUBE_CONTEXT_CLIENT_NAME || "1"),
-        "X-YouTube-Client-Version": clientVersion,
-      },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName,
-            clientVersion,
-            hl:          cfg.HL          || "en",
-            gl:          cfg.GL          || "US",
-            visitorData,
-          },
-        },
-      }),
-    }
-  );
+      clientName: "TVHTML5",
+      clientVersion: "7.20240101",
+      clientNameId: "7",
+    },
+    {
+      clientName: cfg.INNERTUBE_CLIENT_NAME || "WEB",
+      clientVersion: cfg.INNERTUBE_CLIENT_VERSION || "2.20240101",
+      clientNameId: String(cfg.INNERTUBE_CONTEXT_CLIENT_NAME || "1"),
+    },
+  ];
 
-  if (!res.ok) throw new Error(`InnerTube player API failed (${res.status})`);
-  return res.json();
+  let lastError = "All InnerTube client types returned UNPLAYABLE.";
+
+  for (const client of clients) {
+    const res = await fetch(
+      `/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-YouTube-Client-Name":    client.clientNameId,
+          "X-YouTube-Client-Version": client.clientVersion,
+        },
+        body: JSON.stringify({
+          videoId,
+          // Required by YouTube to treat this as a legitimate player request
+          racyCheckOk:    true,
+          contentCheckOk: true,
+          context: {
+            client: {
+              clientName:    client.clientName,
+              clientVersion: client.clientVersion,
+              hl,
+              gl,
+              visitorData,
+            },
+          },
+          playbackContext: {
+            contentPlaybackContext: {
+              currentUrl: `/watch?v=${videoId}`,
+              html5Preference: "HTML5_PREF_WANTS",
+            },
+          },
+        }),
+      }
+    );
+
+    if (!res.ok) {
+      lastError = `InnerTube API HTTP ${res.status} with client ${client.clientName}`;
+      continue;
+    }
+
+    const data = await res.json();
+    if (data.playabilityStatus?.status === "OK") return data;
+
+    lastError =
+      `Client ${client.clientName}: status=${data.playabilityStatus?.status}` +
+      (data.playabilityStatus?.reason ? ` (${data.playabilityStatus.reason})` : "");
+  }
+
+  throw new Error(lastError);
 }
 
 // Resolve a format entry to a usable URL, decrypting signatureCipher if present.
