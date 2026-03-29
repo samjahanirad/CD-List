@@ -199,16 +199,29 @@ async function resolveStreamUrl(audioFormat) {
 }
 
 // ─── Run ──────────────────────────────────────────────────────────────────────
+// Fetches from the page context (youtube.com) so the browser sends the correct
+// Referer and cookies automatically. chrome.downloads.download() would send a
+// chrome-extension:// Referer which YouTube's CDN rejects with a 403.
 
-function Run(data) {
+async function Run(data) {
+  const res = await fetch(data.audioUrl);
+  if (!res.ok) throw new Error(`CDN returned ${res.status} — URL may have expired, try Get Data again.`);
+
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = data.filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+
   return {
-    action: "download",
-    download: {
-      url: data.audioUrl,
-      filename: data.filename,
-    },
     message: data.isCombined
-      ? `Downloading: ${data.filename} (audio+video — SABR stream, no audio-only available)`
+      ? `Downloading: ${data.filename} (video+audio MP4 — no audio-only stream available)`
       : `Downloading: ${data.filename}`,
   };
 }
