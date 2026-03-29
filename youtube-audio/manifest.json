@@ -1,0 +1,7 @@
+{
+  "name": "YouTube Audio Downloader",
+  "version": "1.0.0",
+  "description": "Downloads the audio track of the current YouTube video as .m4a or .webm.",
+  "author": "CD-Driver",
+  "permissions": ["downloads"]
+}

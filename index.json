@@ -6,5 +6,13 @@
     "description": "Download video thumbnails from YouTube, Vimeo, and Dailymotion.",
     "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/thumbnail-downloader/index.js",
     "tags": ["youtube", "vimeo", "thumbnail", "download"]
+  },
+  {
+    "id": "youtube-audio",
+    "name": "YouTube Audio Downloader",
+    "version": "1.0.0",
+    "description": "Downloads the audio track of the current YouTube video as .m4a or .webm.",
+    "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/youtube-audio/index.js",
+    "tags": ["youtube", "audio", "download"]
   }
 ]
