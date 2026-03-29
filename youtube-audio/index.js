@@ -91,6 +91,58 @@ function hasUrl(format) {
   return !!(format.url || format.signatureCipher || format.cipher);
 }
 
+// Find the cipher function name in base.js.
+// Patterns only match the function's opening line — nested braces don't matter.
+function cipherFnName(js) {
+  const patterns = [
+    // Call-site: encodeURIComponent(FnName(
+    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/,
+    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(/,
+    // Structural: assignment form — NAME=function(a){a=a.split(
+    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
+    // Structural: declaration form — function NAME(a){a=a.split(
+    /\bfunction\s+([a-zA-Z0-9$]{2,})\s*\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
+  ];
+  for (const p of patterns) {
+    const m = js.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Extract a function body using bracket-matching (handles any nested braces).
+function bracketExtract(js, fnName) {
+  const esc = fnName.replace(/[$]/g, "\\$");
+  const re = new RegExp(
+    `(?:${esc}\\s*=\\s*function\\s*\\([a-zA-Z]\\)|function\\s+${esc}\\s*\\([a-zA-Z]\\))\\s*\\{`
+  );
+  const m = re.exec(js);
+  if (!m) return null;
+  let depth = 0, i = m.index + m[0].length - 1, start = i + 1;
+  while (i < js.length) {
+    if (js[i] === "{") depth++;
+    else if (js[i] === "}") { if (--depth === 0) break; }
+    i++;
+  }
+  return js.slice(start, i);
+}
+
+// Extract the helper object definition using bracket-matching.
+function helperExtract(js, helperName) {
+  const esc = helperName.replace(/[$]/g, "\\$");
+  const re = new RegExp(`(?:var|let|const)\\s+${esc}\\s*=\\s*\\{|(?:^|[;,])\\s*${esc}\\s*=\\s*\\{`, "m");
+  const m = re.exec(js);
+  if (!m) return null;
+  const brace = js.indexOf("{", m.index + m[0].length - 1);
+  let depth = 0, i = brace;
+  while (i < js.length) {
+    if (js[i] === "{") depth++;
+    else if (js[i] === "}") { if (--depth === 0) break; }
+    i++;
+  }
+  return js.slice(m.index, i + 1);
+}
+
 // Resolve a format entry to a usable URL, decrypting signatureCipher if present.
 async function resolveStreamUrl(audioFormat) {
   if (audioFormat.url) return audioFormat.url;
@@ -112,42 +164,25 @@ async function resolveStreamUrl(audioFormat) {
     return r.text();
   });
 
-  // Try multiple patterns — YouTube changes the player regularly.
-  // Listed from most specific (call-site) to most general (structural).
-  const fnNamePatterns = [
-    // Call-site: c&&d.set(...,encodeURIComponent(Xxa(...
-    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/,
-    // Call-site: permissive variable names
-    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(/,
-    // Structural: function that splits on "", transforms, and joins — always present
-    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-z]\)\{[a-z]\s*=\s*[a-z]\.split\(""\)[^}]+return [a-z]\.join\(""\)\}/,
-    // Structural: alternate spacing
-    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-z]\)\{[a-z]=[a-z]\.split\(""\)[^}]*return [a-z]\.join\(""\)\}/,
-  ];
-  let fnName = null;
-  for (const pattern of fnNamePatterns) {
-    const m = js.match(pattern);
-    if (m) { fnName = m[1]; break; }
-  }
-  if (!fnName) throw new Error("Cannot locate cipher function in player script. Player may have changed.");
+  // Find cipher function name. Patterns only match the START of the function
+  // so nested braces in the body don't break the match.
+  const fnName = cipherFnName(js);
+  if (!fnName) throw new Error("Cannot locate cipher function in player script.");
 
-  const escaped = fnName.replace(/[$]/g, "\\$");
-  const fnMatch = js.match(new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}"));
-  if (!fnMatch) throw new Error("Cannot extract cipher function body.");
-  const fnBody = fnMatch[1];
+  // Extract body using bracket-matching — handles any nested braces.
+  const fnBody = bracketExtract(js, fnName);
+  if (!fnBody) throw new Error("Cannot extract cipher function body.");
 
   const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
   if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
   const helperName = helperNameMatch[1];
 
-  const escapedHelper = helperName.replace(/[$]/g, "\\$");
-  const helperMatch = js.match(
-    new RegExp("var\\s+" + escapedHelper + "\\s*=\\s*\\{[\\s\\S]*?\\};")
-  );
-  if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
+  // Extract helper object using bracket-matching too.
+  const helperSrc = helperExtract(js, helperName);
+  if (!helperSrc) throw new Error("Cannot extract cipher helper object.");
 
   const decSig = new Function(
-    helperMatch[0] +
+    helperSrc +
     "function " + fnName + "(a){" + fnBody + "}" +
     "return " + fnName + "(" + JSON.stringify(encSig) + ");"
   )();
