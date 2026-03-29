@@ -9,112 +9,80 @@ async function DataCollector(currentUrl, context) {
   const videoId = new URLSearchParams(currentUrl.split("?")[1] || "").get("v");
   if (!videoId) throw new Error("Cannot find video ID in the URL.");
 
-  // ytInitialPlayerResponse is only valid when it matches the current URL video.
-  // YouTube SPA navigation changes the URL but not this global.
   const pr = window.ytInitialPlayerResponse;
-  const prMatchesCurrent = pr?.videoDetails?.videoId === videoId;
-
-  if (!prMatchesCurrent) {
-    throw new Error(
-      "Player data is for a different video. Please do a full page refresh (Cmd+Shift+R / Ctrl+Shift+R) on this video."
-    );
+  if (pr?.videoDetails?.videoId !== videoId) {
+    throw new Error("Player data is for a different video. Please hard-refresh (Cmd+Shift+R).");
   }
 
   const title = (pr.videoDetails?.title || "youtube-audio")
     .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
 
   const sd = pr.streamingData;
-  if (!sd) throw new Error("No streamingData in player response. Video may be unavailable.");
+  if (!sd) throw new Error("No streamingData in player response.");
 
-  // ── 1. Try audio-only adaptive formats (best: no video, smaller file) ───────
+  // ── 1. Try audio-only adaptive formats ───────────────────────────────────────
   let audioFormat = pickAudioFormat(sd.adaptiveFormats || []);
   let isCombined  = false;
 
   if (audioFormat && !hasUrl(audioFormat)) {
-    // YouTube SABR protocol: adaptive formats have metadata but no URLs.
-    // Fall through to combined formats below.
-    audioFormat = null;
+    audioFormat = null; // SABR: metadata present but no URL
   }
 
-  // ── 2. Fall back to combined audio+video streams (legacy MP4s) ───────────────
-  // YouTube still serves these as direct URLs for backward compatibility.
-  // itag 22 = 720p MP4 (H.264 + AAC ~192kbps), itag 18 = 360p MP4 (AAC ~96kbps)
+  // ── 2. Fall back to combined audio+video MP4s (legacy, still have URLs) ──────
   if (!audioFormat) {
-    const combined = sd.formats || [];
-    const combinedFormat = [22, 18]
-      .map((itag) => combined.find((f) => f.itag === itag))
+    const fmt = [22, 18]
+      .map((itag) => (sd.formats || []).find((f) => f.itag === itag))
       .find((f) => f && hasUrl(f));
-
-    if (combinedFormat) {
-      audioFormat = combinedFormat;
-      isCombined  = true;
-    }
+    if (fmt) { audioFormat = fmt; isCombined = true; }
   }
 
   if (!audioFormat) {
-    const sdKeys = Object.keys(sd).join(", ");
-    throw new Error(
-      `No downloadable stream found. YouTube is using SABR streaming for all formats. ` +
-      `streamingData keys: ${sdKeys}`
-    );
+    throw new Error(`No downloadable stream. streamingData keys: ${Object.keys(sd).join(", ")}`);
   }
 
-  const audioUrl = await resolveStreamUrl(audioFormat);
+  // ── 3. Fetch base.js once — needed for both cipher and n-param transform ─────
+  const playerSrc = Array.from(document.querySelectorAll("script[src]"))
+    .map((s) => s.src).find((src) => src.includes("base.js"));
+  if (!playerSrc) throw new Error("Cannot find YouTube player script (base.js).");
 
-  // Combined streams are MP4 (video+audio). Audio-only adaptive are m4a/webm.
+  const js = await fetch(playerSrc).then((r) => {
+    if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
+    return r.text();
+  });
+
+  // ── 4. Resolve stream URL (decrypt signatureCipher if needed) ────────────────
+  let audioUrl = await resolveStreamUrl(audioFormat, js);
+
+  // ── 5. Transform n-parameter — without this YouTube CDN returns 403 ──────────
+  audioUrl = transformNParam(audioUrl, js);
+
   const mimeType = audioFormat.mimeType || "";
   const ext = isCombined ? "mp4" : (mimeType.includes("webm") ? "webm" : "m4a");
 
-  return {
-    title,
-    audioUrl,
-    filename: `${title}.${ext}`,
-    itag: audioFormat.itag,
-    mimeType,
-    isCombined,
-  };
+  return { title, audioUrl, filename: `${title}.${ext}`, itag: audioFormat.itag, mimeType, isCombined };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function pickAudioFormat(formats) {
-  // 141 = AAC 256kbps (.m4a), 140 = AAC 128kbps (.m4a), 251/250/249 = Opus (.webm)
   return (
-    [141, 140, 251, 250, 249]
-      .map((itag) => formats.find((f) => f.itag === itag))
-      .find(Boolean) ||
+    [141, 140, 251, 250, 249].map((itag) => formats.find((f) => f.itag === itag)).find(Boolean) ||
     formats.find((f) => (f.mimeType || "").startsWith("audio/"))
   );
 }
 
-function hasUrl(format) {
-  return !!(format.url || format.signatureCipher || format.cipher);
+function hasUrl(fmt) {
+  return !!(fmt.url || fmt.signatureCipher || fmt.cipher);
 }
 
-// Find the cipher function name in base.js.
-// Patterns only match the function's opening line — nested braces don't matter.
-function cipherFnName(js) {
-  const patterns = [
-    // Call-site: encodeURIComponent(FnName(
-    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/,
-    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(/,
-    // Structural: assignment form — NAME=function(a){a=a.split(
-    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
-    // Structural: declaration form — function NAME(a){a=a.split(
-    /\bfunction\s+([a-zA-Z0-9$]{2,})\s*\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
-  ];
-  for (const p of patterns) {
-    const m = js.match(p);
-    if (m) return m[1];
-  }
-  return null;
-}
+// ── Bracket-matching extractor ────────────────────────────────────────────────
+// Finds the body of a named function in minified JS by counting { and }.
+// Handles any nesting depth — regex alternatives always break on inner braces.
 
-// Extract a function body using bracket-matching (handles any nested braces).
 function bracketExtract(js, fnName) {
   const esc = fnName.replace(/[$]/g, "\\$");
   const re = new RegExp(
-    `(?:${esc}\\s*=\\s*function\\s*\\([a-zA-Z]\\)|function\\s+${esc}\\s*\\([a-zA-Z]\\))\\s*\\{`
+    `(?:${esc}\\s*=\\s*function\\s*\\([a-zA-Z,\\s]*\\)|function\\s+${esc}\\s*\\([a-zA-Z,\\s]*\\))\\s*\\{`
   );
   const m = re.exec(js);
   if (!m) return null;
@@ -127,7 +95,6 @@ function bracketExtract(js, fnName) {
   return js.slice(start, i);
 }
 
-// Extract the helper object definition using bracket-matching.
 function helperExtract(js, helperName) {
   const esc = helperName.replace(/[$]/g, "\\$");
   const re = new RegExp(`(?:var|let|const)\\s+${esc}\\s*=\\s*\\{|(?:^|[;,])\\s*${esc}\\s*=\\s*\\{`, "m");
@@ -143,33 +110,34 @@ function helperExtract(js, helperName) {
   return js.slice(m.index, i + 1);
 }
 
-// Resolve a format entry to a usable URL, decrypting signatureCipher if present.
-async function resolveStreamUrl(audioFormat) {
+// ── Signature cipher ──────────────────────────────────────────────────────────
+
+function cipherFnName(js) {
+  const patterns = [
+    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/,
+    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(/,
+    /([a-zA-Z0-9$]{2,})\s*=\s*function\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
+    /\bfunction\s+([a-zA-Z0-9$]{2,})\s*\([a-zA-Z]\)\s*\{\s*[a-zA-Z]\s*=\s*[a-zA-Z]\.split\(["']["']\)/,
+  ];
+  for (const p of patterns) {
+    const m = js.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+async function resolveStreamUrl(audioFormat, js) {
   if (audioFormat.url) return audioFormat.url;
 
   const cipherStr = audioFormat.signatureCipher || audioFormat.cipher;
   const p = new URLSearchParams(cipherStr);
-  const encSig   = p.get("s");
-  const sigParam  = p.get("sp") || "sig";
-  const baseUrl   = p.get("url");
+  const encSig  = p.get("s");
+  const sigParam = p.get("sp") || "sig";
+  const baseUrl  = p.get("url");
   if (!encSig || !baseUrl) throw new Error("Malformed cipher in stream data.");
 
-  const playerSrc = Array.from(document.querySelectorAll("script[src]"))
-    .map((s) => s.src)
-    .find((src) => src.includes("base.js"));
-  if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
-
-  const js = await fetch(playerSrc).then((r) => {
-    if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
-    return r.text();
-  });
-
-  // Find cipher function name. Patterns only match the START of the function
-  // so nested braces in the body don't break the match.
   const fnName = cipherFnName(js);
   if (!fnName) {
-    // Diagnostic: show up to 3 snippets around split( calls so we can
-    // see the exact pattern YouTube is using in the current player.
     const snippets = [];
     const re = /.{0,80}split\(.{0,80}/g;
     let m;
@@ -177,35 +145,73 @@ async function resolveStreamUrl(audioFormat) {
     throw new Error("Cipher fn not found. split() contexts: " + snippets.join(" ||| "));
   }
 
-  // Extract body using bracket-matching — handles any nested braces.
   const fnBody = bracketExtract(js, fnName);
   if (!fnBody) throw new Error("Cannot extract cipher function body.");
 
   const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
   if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
-  const helperName = helperNameMatch[1];
 
-  // Extract helper object using bracket-matching too.
-  const helperSrc = helperExtract(js, helperName);
+  const helperSrc = helperExtract(js, helperNameMatch[1]);
   if (!helperSrc) throw new Error("Cannot extract cipher helper object.");
 
   const decSig = new Function(
-    helperSrc +
-    "function " + fnName + "(a){" + fnBody + "}" +
+    helperSrc + "function " + fnName + "(a){" + fnBody + "}" +
     "return " + fnName + "(" + JSON.stringify(encSig) + ");"
   )();
 
   return baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
 }
 
+// ── N-parameter transform ─────────────────────────────────────────────────────
+// The n-param in every YouTube stream URL must be transformed by a function
+// in base.js before the CDN will serve the file. Without this it returns 403.
+
+function nFunctionName(js) {
+  // Pattern 1: nArr[0](b) — array-wrapped function (most common in recent players)
+  const arrMatch = js.match(/\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)\[(\d+)\]\([a-zA-Z0-9$]+\)/);
+  if (arrMatch) {
+    const listMatch = js.match(
+      new RegExp(`var\\s+${arrMatch[1].replace(/[$]/g, "\\$")}\\s*=\\s*\\[([a-zA-Z0-9$]+)`)
+    );
+    if (listMatch) return listMatch[1];
+  }
+  // Pattern 2: direct call nFunc(b)
+  const direct = js.match(/\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)\([a-zA-Z0-9$]+\)/);
+  if (direct) return direct[1];
+
+  return null;
+}
+
+function transformNParam(url, js) {
+  const nMatch = url.match(/[?&]n=([^&]+)/);
+  if (!nMatch) return url;
+
+  const nVal = decodeURIComponent(nMatch[1]);
+  const fnName = nFunctionName(js);
+  if (!fnName) return url; // can't find function — return as-is, may still 403
+
+  const fnBody = bracketExtract(js, fnName);
+  if (!fnBody) return url;
+
+  try {
+    const transformed = new Function(
+      "function " + fnName + "(a){" + fnBody + "}" +
+      "return " + fnName + "(" + JSON.stringify(nVal) + ");"
+    )();
+    if (typeof transformed === "string" && transformed !== nVal) {
+      return url.replace(/([?&]n=)[^&]+/, "$1" + encodeURIComponent(transformed));
+    }
+  } catch (_) {}
+
+  return url;
+}
+
 // ─── Run ──────────────────────────────────────────────────────────────────────
-// Fetches from the page context (youtube.com) so the browser sends the correct
-// Referer and cookies automatically. chrome.downloads.download() would send a
-// chrome-extension:// Referer which YouTube's CDN rejects with a 403.
+// Fetches from the page context (youtube.com) — correct Referer + cookies.
 
 async function Run(data) {
   const res = await fetch(data.audioUrl);
-  if (!res.ok) throw new Error(`CDN returned ${res.status} — URL may have expired, try Get Data again.`);
+  if (!res.ok) throw new Error(`CDN returned ${res.status} — try Get Data again.`);
 
   const blob = await res.blob();
   const blobUrl = URL.createObjectURL(blob);
@@ -216,12 +222,11 @@ async function Run(data) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-
   setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
 
   return {
     message: data.isCombined
-      ? `Downloading: ${data.filename} (video+audio MP4 — no audio-only stream available)`
+      ? `Downloading: ${data.filename} (video+audio MP4 — no audio-only available)`
       : `Downloading: ${data.filename}`,
   };
 }
