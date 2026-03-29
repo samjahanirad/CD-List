@@ -1,14 +1,11 @@
 // ─── DataCollector ────────────────────────────────────────────────────────────
-// Runs in page MAIN world. Returns a Promise — async is supported by the core.
-// No explicit cookie handling needed: fetch() here runs on the YouTube page,
-// so the browser includes YouTube session cookies automatically.
+// Runs in page MAIN world. Returns a Promise (async is supported by the core).
 
 async function DataCollector(currentUrl, context) {
   if (!currentUrl.includes("youtube.com/watch")) {
     throw new Error("Open a YouTube video page first.");
   }
 
-  // Guard against SPA stale data: check video ID matches the URL
   const urlVideoId = new URLSearchParams(currentUrl.split("?")[1] || "").get("v");
   const pr = window.ytInitialPlayerResponse;
   if (!pr) throw new Error("YouTube player data not found. Try refreshing the page.");
@@ -18,154 +15,30 @@ async function DataCollector(currentUrl, context) {
     throw new Error("Player data is stale. Please refresh the page.");
   }
 
-  const { videoDetails, streamingData } = pr;
-  if (!streamingData) {
-    throw new Error("No streaming data available. Video may be unavailable or restricted.");
-  }
+  const videoId = prVideoId || urlVideoId;
+  if (!videoId) throw new Error("Cannot determine video ID.");
 
-  // Sanitize title for use as filename
-  const title = (videoDetails?.title || "youtube-audio")
+  const title = (pr.videoDetails?.title || "youtube-audio")
     .replace(/[<>:"/\\|?*]/g, "")
     .trim()
     .slice(0, 100);
 
-  const formats = streamingData.adaptiveFormats || [];
+  // ── Try ytInitialPlayerResponse first ──────────────────────────────────────
+  let audioFormat = pickAudioFormat(pr.streamingData?.adaptiveFormats || []);
 
-  // Pick best audio-only stream:
-  //   141 = AAC 256kbps (.m4a)  <- best quality, broadest compatibility
-  //   140 = AAC 128kbps (.m4a)
-  //   251 = Opus 128kbps (.webm)
-  //   250 = Opus 70kbps  (.webm)
-  //   249 = Opus 50kbps  (.webm)
-  const audioFormat =
-    [141, 140, 251, 250, 249]
-      .map((itag) => formats.find((f) => f.itag === itag))
-      .find(Boolean) ||
-    formats.find((f) => (f.mimeType || "").startsWith("audio/"));
-
-  if (!audioFormat) throw new Error("No audio-only stream found for this video.");
-
-  // ── Resolve the stream URL ──────────────────────────────────────────────────
-
-  let audioUrl;
-
-  if (audioFormat.url) {
-    // Direct URL — most public videos, already authenticated for this session
-    audioUrl = audioFormat.url;
-
-  } else if (audioFormat.signatureCipher) {
-    // Protected video: signature must be decrypted using YouTube's own player JS.
-    // fetch(base.js) sends YouTube cookies automatically (page context).
-
-    const p = new URLSearchParams(audioFormat.signatureCipher);
-    const encSig  = p.get("s");
-    const sigParam = p.get("sp") || "sig";
-    const baseUrl  = p.get("url");
-    if (!encSig || !baseUrl) throw new Error("Malformed signatureCipher in stream data.");
-
-    // Find the player base.js URL already loaded in the page
-    const playerSrc = Array.from(document.querySelectorAll("script[src]"))
-      .map((s) => s.src)
-      .find((src) => src.includes("base.js"));
-    if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
-
-    // Fetch base.js — cookies included automatically by the browser
-    const js = await fetch(playerSrc).then((r) => {
-      if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
-      return r.text();
-    });
-
-    // Find the cipher function name
-    // YouTube calls it like: encodeURIComponent(Xxa(decodeURIComponent(...)))
-    const fnNameMatch = js.match(
-      /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
-    );
-    if (!fnNameMatch) throw new Error("Cannot locate signature cipher function in player script.");
-    const fnName = fnNameMatch[1];
-
-    // Extract the cipher function body: fnName=function(a){...}
-    const escaped = fnName.replace(/[$]/g, "\\$");
-    const fnMatch = js.match(
-      new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}")
-    );
-    if (!fnMatch) throw new Error("Cannot extract cipher function body.");
-    const fnBody = fnMatch[1];
-
-    // The function body calls a helper object for swap/slice/reverse ops
-    const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
-    if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
-    const helperName = helperNameMatch[1];
-
-    const escapedHelper = helperName.replace(/[$]/g, "\\$");
-    const helperMatch = js.match(
-      new RegExp("var\\s+" + escapedHelper + "\\s*=\\s*\\{[\\s\\S]*?\\};")
-    );
-    if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
-
-    // Execute the cipher to decrypt the signature
-    const decSig = new Function(
-      helperMatch[0] +
-      "function " + fnName + "(a){" + fnBody + "}" +
-      "return " + fnName + "(" + JSON.stringify(encSig) + ");"
-    )();
-
-    audioUrl = baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
-
-  } else if (audioFormat.cipher) {
-    // Older YouTube player versions used "cipher" instead of "signatureCipher"
-    const p = new URLSearchParams(audioFormat.cipher);
-    const encSig  = p.get("s");
-    const sigParam = p.get("sp") || "sig";
-    const baseUrl  = p.get("url");
-    if (!encSig || !baseUrl) throw new Error("Malformed cipher in stream data.");
-
-    const playerSrc = Array.from(document.querySelectorAll("script[src]"))
-      .map((s) => s.src)
-      .find((src) => src.includes("base.js"));
-    if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
-
-    const js = await fetch(playerSrc).then((r) => {
-      if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
-      return r.text();
-    });
-
-    const fnNameMatch = js.match(
-      /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
-    );
-    if (!fnNameMatch) throw new Error("Cannot locate cipher function in player script.");
-    const fnName = fnNameMatch[1];
-
-    const escaped = fnName.replace(/[$]/g, "\\$");
-    const fnMatch = js.match(
-      new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}")
-    );
-    if (!fnMatch) throw new Error("Cannot extract cipher function body.");
-    const fnBody = fnMatch[1];
-
-    const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
-    if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
-    const helperName = helperNameMatch[1];
-
-    const escapedHelper = helperName.replace(/[$]/g, "\\$");
-    const helperMatch = js.match(
-      new RegExp("var\\s+" + escapedHelper + "\\s*=\\s*\\{[\\s\\S]*?\\};")
-    );
-    if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
-
-    const decSig = new Function(
-      helperMatch[0] +
-      "function " + fnName + "(a){" + fnBody + "}" +
-      "return " + fnName + "(" + JSON.stringify(encSig) + ");"
-    )();
-
-    audioUrl = baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
-
-  } else {
-    // Diagnostic: show what keys are actually present to help debug
-    const keys = Object.keys(audioFormat).join(", ");
-    throw new Error(`Unexpected stream format. Keys present: ${keys}`);
+  // If the format has no resolvable URL, YouTube withheld stream URLs from the
+  // initial page payload. Fall back to a fresh InnerTube API call.
+  if (!audioFormat || !hasUrl(audioFormat)) {
+    const fresh = await fetchInnerTubePlayer(videoId);
+    audioFormat = pickAudioFormat(fresh.streamingData?.adaptiveFormats || []);
+    if (!audioFormat) throw new Error("No audio-only stream found (InnerTube API also returned none).");
+    if (!hasUrl(audioFormat)) {
+      const keys = Object.keys(audioFormat).join(", ");
+      throw new Error(`Stream URL still missing after InnerTube refresh. Keys: ${keys}`);
+    }
   }
 
+  const audioUrl = await resolveStreamUrl(audioFormat);
   const mimeType = audioFormat.mimeType || "";
   const ext = mimeType.includes("webm") ? "webm" : "m4a";
 
@@ -178,8 +51,107 @@ async function DataCollector(currentUrl, context) {
   };
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function pickAudioFormat(formats) {
+  // Prefer high-quality AAC (.m4a), fall back to Opus (.webm)
+  // 141 = AAC 256kbps, 140 = AAC 128kbps, 251/250/249 = Opus
+  return (
+    [141, 140, 251, 250, 249]
+      .map((itag) => formats.find((f) => f.itag === itag))
+      .find(Boolean) ||
+    formats.find((f) => (f.mimeType || "").startsWith("audio/"))
+  );
+}
+
+function hasUrl(format) {
+  return !!(format.url || format.signatureCipher || format.cipher);
+}
+
+// Call YouTube's own InnerTube player API from the page context.
+// Cookies are included automatically — same as any fetch() on youtube.com.
+async function fetchInnerTubePlayer(videoId) {
+  const cfg = window.yt?.config_ || {};
+  const apiKey = cfg.INNERTUBE_API_KEY || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+
+  const res = await fetch(
+    `/youtubei/v1/player?key=${encodeURIComponent(apiKey)}&prettyPrint=false`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: cfg.INNERTUBE_CLIENT_NAME || "WEB",
+            clientVersion: cfg.INNERTUBE_CLIENT_VERSION || "2.20240101",
+            hl: cfg.HL || "en",
+            gl: cfg.GL || "US",
+          },
+        },
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(`InnerTube player API failed (${res.status})`);
+  return res.json();
+}
+
+// Resolve a format entry to a plain URL, decrypting signatureCipher if needed.
+async function resolveStreamUrl(audioFormat) {
+  if (audioFormat.url) return audioFormat.url;
+
+  const cipherStr = audioFormat.signatureCipher || audioFormat.cipher;
+  const p = new URLSearchParams(cipherStr);
+  const encSig  = p.get("s");
+  const sigParam = p.get("sp") || "sig";
+  const baseUrl  = p.get("url");
+  if (!encSig || !baseUrl) throw new Error("Malformed cipher in stream data.");
+
+  // Find base.js already loaded by the page
+  const playerSrc = Array.from(document.querySelectorAll("script[src]"))
+    .map((s) => s.src)
+    .find((src) => src.includes("base.js"));
+  if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
+
+  // Fetch base.js — browser sends YouTube cookies automatically
+  const js = await fetch(playerSrc).then((r) => {
+    if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
+    return r.text();
+  });
+
+  // Find cipher function name
+  const fnNameMatch = js.match(
+    /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
+  );
+  if (!fnNameMatch) throw new Error("Cannot locate cipher function in player script.");
+  const fnName = fnNameMatch[1];
+
+  const escaped = fnName.replace(/[$]/g, "\\$");
+  const fnMatch = js.match(new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}"));
+  if (!fnMatch) throw new Error("Cannot extract cipher function body.");
+  const fnBody = fnMatch[1];
+
+  const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
+  if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
+  const helperName = helperNameMatch[1];
+
+  const escapedHelper = helperName.replace(/[$]/g, "\\$");
+  const helperMatch = js.match(
+    new RegExp("var\\s+" + escapedHelper + "\\s*=\\s*\\{[\\s\\S]*?\\};")
+  );
+  if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
+
+  const decSig = new Function(
+    helperMatch[0] +
+    "function " + fnName + "(a){" + fnBody + "}" +
+    "return " + fnName + "(" + JSON.stringify(encSig) + ");"
+  )();
+
+  return baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
+}
+
 // ─── Run ──────────────────────────────────────────────────────────────────────
-// Receives DataCollector output. Triggers a browser download via the extension.
 
 function Run(data) {
   return {
