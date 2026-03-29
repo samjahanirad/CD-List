@@ -30,8 +30,24 @@ async function DataCollector(currentUrl, context) {
   // initial page payload. Fall back to a fresh InnerTube API call.
   if (!audioFormat || !hasUrl(audioFormat)) {
     const fresh = await fetchInnerTubePlayer(videoId);
-    audioFormat = pickAudioFormat(fresh.streamingData?.adaptiveFormats || []);
-    if (!audioFormat) throw new Error("No audio-only stream found (InnerTube API also returned none).");
+    // Diagnostic: log the full response structure so we can debug
+    const sd = fresh.streamingData;
+    const status = fresh.playabilityStatus?.status || "unknown";
+    const reason = fresh.playabilityStatus?.reason || "";
+    const adaptiveCount = sd?.adaptiveFormats?.length ?? "missing";
+    const formatsCount = sd?.formats?.length ?? "missing";
+    const sdKeys = sd ? Object.keys(sd).join(", ") : "streamingData missing";
+
+    audioFormat = pickAudioFormat(sd?.adaptiveFormats || [])
+               || pickAudioFormat(sd?.formats || []);
+
+    if (!audioFormat) {
+      throw new Error(
+        `No audio stream found. playabilityStatus=${status}${reason ? " ("+reason+")" : ""}. ` +
+        `adaptiveFormats=${adaptiveCount}, formats=${formatsCount}. ` +
+        `streamingData keys: ${sdKeys}`
+      );
+    }
     if (!hasUrl(audioFormat)) {
       const keys = Object.keys(audioFormat).join(", ");
       throw new Error(`Stream URL still missing after InnerTube refresh. Keys: ${keys}`);
