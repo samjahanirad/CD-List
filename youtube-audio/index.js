@@ -111,8 +111,59 @@ async function DataCollector(currentUrl, context) {
 
     audioUrl = baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
 
+  } else if (audioFormat.cipher) {
+    // Older YouTube player versions used "cipher" instead of "signatureCipher"
+    const p = new URLSearchParams(audioFormat.cipher);
+    const encSig  = p.get("s");
+    const sigParam = p.get("sp") || "sig";
+    const baseUrl  = p.get("url");
+    if (!encSig || !baseUrl) throw new Error("Malformed cipher in stream data.");
+
+    const playerSrc = Array.from(document.querySelectorAll("script[src]"))
+      .map((s) => s.src)
+      .find((src) => src.includes("base.js"));
+    if (!playerSrc) throw new Error("Cannot find YouTube player script to decrypt signature.");
+
+    const js = await fetch(playerSrc).then((r) => {
+      if (!r.ok) throw new Error(`Failed to fetch player script (${r.status})`);
+      return r.text();
+    });
+
+    const fnNameMatch = js.match(
+      /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
+    );
+    if (!fnNameMatch) throw new Error("Cannot locate cipher function in player script.");
+    const fnName = fnNameMatch[1];
+
+    const escaped = fnName.replace(/[$]/g, "\\$");
+    const fnMatch = js.match(
+      new RegExp(escaped + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}")
+    );
+    if (!fnMatch) throw new Error("Cannot extract cipher function body.");
+    const fnBody = fnMatch[1];
+
+    const helperNameMatch = fnBody.match(/([a-zA-Z0-9$]{2,})\./);
+    if (!helperNameMatch) throw new Error("Cannot find cipher helper object name.");
+    const helperName = helperNameMatch[1];
+
+    const escapedHelper = helperName.replace(/[$]/g, "\\$");
+    const helperMatch = js.match(
+      new RegExp("var\\s+" + escapedHelper + "\\s*=\\s*\\{[\\s\\S]*?\\};")
+    );
+    if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
+
+    const decSig = new Function(
+      helperMatch[0] +
+      "function " + fnName + "(a){" + fnBody + "}" +
+      "return " + fnName + "(" + JSON.stringify(encSig) + ");"
+    )();
+
+    audioUrl = baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
+
   } else {
-    throw new Error("Unexpected stream format: no url or signatureCipher found.");
+    // Diagnostic: show what keys are actually present to help debug
+    const keys = Object.keys(audioFormat).join(", ");
+    throw new Error(`Unexpected stream format. Keys present: ${keys}`);
   }
 
   const mimeType = audioFormat.mimeType || "";
