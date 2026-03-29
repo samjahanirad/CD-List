@@ -1,8 +1,0 @@
-{
-  "name": "ytdl-cd",
-  "version": "1.5.0",
-  "description": "Downloads YouTube videos. Uses ANDROID_VR/ANDROID InnerTube clients with full nsig (n-parameter) decoding via player.js; falls back to service-worker downloader.",
-  "author": "CD-Driver",
-  "permissions": ["downloads"],
-  "libs": ["lib.js"]
-}
