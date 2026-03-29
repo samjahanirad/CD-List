@@ -167,7 +167,15 @@ async function resolveStreamUrl(audioFormat) {
   // Find cipher function name. Patterns only match the START of the function
   // so nested braces in the body don't break the match.
   const fnName = cipherFnName(js);
-  if (!fnName) throw new Error("Cannot locate cipher function in player script.");
+  if (!fnName) {
+    // Diagnostic: show up to 3 snippets around split( calls so we can
+    // see the exact pattern YouTube is using in the current player.
+    const snippets = [];
+    const re = /.{0,80}split\(.{0,80}/g;
+    let m;
+    while ((m = re.exec(js)) !== null && snippets.length < 3) snippets.push(m[0]);
+    throw new Error("Cipher fn not found. split() contexts: " + snippets.join(" ||| "));
+  }
 
   // Extract body using bracket-matching — handles any nested braces.
   const fnBody = bracketExtract(js, fnName);
