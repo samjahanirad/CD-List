@@ -1,7 +1,7 @@
 // CD Metadata
 const CD_ID = "youtube-audio";
 const CD_NAME = "YouTube Audio Downloader";
-const CD_VERSION = "3.1.0";
+const CD_VERSION = "3.2.0";
 const CD_DESCRIPTION = "Downloads the audio track of the current YouTube video as .m4a or .webm.";
 
 // ─── DataCollector ────────────────────────────────────────────────────────────
@@ -32,16 +32,21 @@ async function DataCollector(currentUrl, context) {
 
   // ── 1. Pick best format ───────────────────────────────────────────────────────
   // Audio-only adaptive preferred; combined MP4 as last resort.
+  // Only consider formats that carry a usable URL (url, signatureCipher, or cipher).
+  // Some YouTube adaptive formats exist as metadata-only entries (no URL) when the
+  // player is expected to use the DASH manifest instead — skip those.
   const adaptiveFormats = streamingData.adaptiveFormats || [];
   const regularFormats  = streamingData.formats || [];
 
+  const hasUrl = (f) => !!(f.url || f.signatureCipher || f.cipher);
+
   const audioFormat =
     [141, 140, 251, 250, 249]
-      .map((itag) => adaptiveFormats.find((f) => f.itag === itag))
+      .map((itag) => adaptiveFormats.find((f) => f.itag === itag && hasUrl(f)))
       .find(Boolean) ||
-    adaptiveFormats.find((f) => (f.mimeType || "").startsWith("audio/")) ||
-    regularFormats.find((f) => f.itag === 18) ||
-    regularFormats.find((f) => f.mimeType);
+    adaptiveFormats.find((f) => (f.mimeType || "").startsWith("audio/") && hasUrl(f)) ||
+    regularFormats.find((f) => f.itag === 18 && hasUrl(f)) ||
+    regularFormats.find((f) => f.mimeType && hasUrl(f));
 
   if (!audioFormat) throw new Error("No downloadable stream found for this video.");
 
