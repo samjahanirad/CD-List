@@ -1,7 +1,7 @@
 // CD Metadata
 const CD_ID = "youtube-audio";
 const CD_NAME = "YouTube Audio Downloader";
-const CD_VERSION = "4.0.0";
+const CD_VERSION = "4.1.0";
 const CD_DESCRIPTION = "Downloads the audio track of the current YouTube video as .m4a or .webm.";
 
 // ─── DataCollector ────────────────────────────────────────────────────────────
@@ -191,12 +191,18 @@ function descrambleN(js, nRaw) {
 
   const arrayMatch = ref.match(/^([a-zA-Z0-9$]+)\[(\d+)\]$/);
 
+  // Build an invocation expression, then run it with auto dependency injection.
+  // Both the array and direct-function paths end up as a single code string so
+  // any ReferenceError (like "bs is not defined") triggers an automatic retry
+  // where we find and prepend that variable's definition from base.js.
+
+  let invocation;
+
   if (arrayMatch) {
     const [, arrName, idxStr] = arrayMatch;
     const idx = parseInt(idxStr, 10);
     const esc = arrName.replace(/[$]/g, "\\$");
 
-    // Support var / let / const declarations
     const startRe    = new RegExp("(?:var|let|const)\\s+" + esc + "\\s*=\\s*\\[");
     const startMatch = js.match(startRe);
     if (!startMatch) throw new Error("array '" + arrName + "' declaration not found");
@@ -205,14 +211,7 @@ function descrambleN(js, nRaw) {
     const arrLiteral = extractBrackets(js, bracketPos);
     if (!arrLiteral) throw new Error("could not extract array '" + arrName + "' literal");
 
-    let arr;
-    try { arr = new Function("return " + arrLiteral)(); }
-    catch (e) { throw new Error("array '" + arrName + "' eval: " + e.message); }
-
-    if (typeof arr[idx] !== "function")
-      throw new Error(arrName + "[" + idx + "] is " + typeof arr[idx] + ", expected function");
-
-    return arr[idx](nRaw);
+    invocation = "return (" + arrLiteral + ")[" + idx + "](" + JSON.stringify(nRaw) + ");";
 
   } else {
     const esc        = ref.replace(/[$]/g, "\\$");
@@ -225,9 +224,60 @@ function descrambleN(js, nRaw) {
     const body      = extractBody(js, bodyStart);
     if (!body) throw new Error("could not extract body of '" + ref + "'");
 
-    try { return new Function(arg, body)(nRaw); }
-    catch (e) { throw new Error("function '" + ref + "' execution: " + e.message); }
+    invocation = "return (function(" + arg + "){" + body + "})(" + JSON.stringify(nRaw) + ");";
   }
+
+  return runWithDeps(js, invocation);
+}
+
+// Executes `code` via new Function(code)(), retrying up to 5 times.
+// On each ReferenceError it finds the missing variable's definition in the
+// player JS and prepends it, so closured helpers like `bs` resolve correctly.
+function runWithDeps(js, code, depth) {
+  depth = depth || 0;
+  if (depth > 5) throw new Error("too many dependency resolution attempts");
+  try {
+    return new Function(code)();
+  } catch (e) {
+    if (!(e instanceof ReferenceError)) throw e;
+    const missing = (e.message.match(/^([a-zA-Z$_][a-zA-Z0-9$_]*)\s+is not defined/) || [])[1];
+    if (!missing) throw e;
+    const dep = findDefinition(js, missing);
+    if (!dep) throw new Error("dependency '" + missing + "' not found in player script");
+    return runWithDeps(js, dep + "\n" + code, depth + 1);
+  }
+}
+
+// Finds and returns a var/let/const definition for `name` from base.js.
+// Handles array literals [...] and object literals {...}.
+function findDefinition(js, name) {
+  const esc = name.replace(/[$]/g, "\\$");
+
+  // Try array: var NAME=[...]
+  const arrMatch = js.match(new RegExp("(?:var|let|const)\\s+" + esc + "\\s*=\\s*\\["));
+  if (arrMatch) {
+    const pos     = arrMatch.index + arrMatch[0].length - 1;
+    const content = extractBrackets(js, pos);
+    if (content) return "var " + name + "=" + content + ";";
+  }
+
+  // Try object: var NAME={...}
+  const objMatch = js.match(new RegExp("(?:var|let|const)\\s+" + esc + "\\s*=\\s*\\{"));
+  if (objMatch) {
+    const pos     = js.indexOf("{", objMatch.index + objMatch[0].length - 1);
+    const content = extractBody(js, pos);
+    if (content) return "var " + name + "={" + content + "};";
+  }
+
+  // Try function: var NAME=function(...){...}
+  const fnMatch = js.match(new RegExp("(?:var|let|const)\\s+" + esc + "\\s*=\\s*function\\([^)]*\\)\\s*\\{"));
+  if (fnMatch) {
+    const pos     = js.indexOf("{", fnMatch.index + fnMatch[0].length - 1);
+    const content = extractBody(js, pos);
+    if (content) return fnMatch[0].replace(/^(?:var|let|const)\s+/, "var ") + content + "};";
+  }
+
+  return null;
 }
 
 // Extracts a balanced [...] block starting at openBracket.
