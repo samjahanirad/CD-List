@@ -1,7 +1,7 @@
 // CD Metadata
 const CD_ID = "youtube-audio";
 const CD_NAME = "YouTube Audio Downloader";
-const CD_VERSION = "3.2.0";
+const CD_VERSION = "4.0.0";
 const CD_DESCRIPTION = "Downloads the audio track of the current YouTube video as .m4a or .webm.";
 
 // ─── DataCollector ────────────────────────────────────────────────────────────
@@ -21,23 +21,14 @@ async function DataCollector(currentUrl, context) {
   }
 
   const { videoDetails, streamingData } = pr;
-  if (!streamingData) {
-    throw new Error("No streaming data available. Video may be unavailable or restricted.");
-  }
+  if (!streamingData) throw new Error("No streaming data available.");
 
   const title = (videoDetails?.title || "youtube-audio")
-    .replace(/[<>:"/\\|?*]/g, "")
-    .trim()
-    .slice(0, 100);
+    .replace(/[<>:"/\\|?*]/g, "").trim().slice(0, 100);
 
-  // ── 1. Pick best format ───────────────────────────────────────────────────────
-  // Audio-only adaptive preferred; combined MP4 as last resort.
-  // Only consider formats that carry a usable URL (url, signatureCipher, or cipher).
-  // Some YouTube adaptive formats exist as metadata-only entries (no URL) when the
-  // player is expected to use the DASH manifest instead — skip those.
+  // ── 1. Pick best format with a usable URL ─────────────────────────────────────
   const adaptiveFormats = streamingData.adaptiveFormats || [];
   const regularFormats  = streamingData.formats || [];
-
   const hasUrl = (f) => !!(f.url || f.signatureCipher || f.cipher);
 
   const audioFormat =
@@ -54,8 +45,7 @@ async function DataCollector(currentUrl, context) {
 
   // ── 2. Load base.js (cached per player build) ─────────────────────────────────
   const playerSrc = Array.from(document.querySelectorAll("script[src]"))
-    .map((s) => s.src)
-    .find((src) => src.includes("base.js"));
+    .map((s) => s.src).find((src) => src.includes("base.js"));
   if (!playerSrc) throw new Error("Cannot find YouTube player script.");
 
   let js;
@@ -77,7 +67,7 @@ async function DataCollector(currentUrl, context) {
     audioUrl = audioFormat.url;
 
   } else if (audioFormat.signatureCipher || audioFormat.cipher) {
-    const p = new URLSearchParams(audioFormat.signatureCipher || audioFormat.cipher);
+    const p       = new URLSearchParams(audioFormat.signatureCipher || audioFormat.cipher);
     const encSig  = p.get("s");
     const sigParam = p.get("sp") || "sig";
     const baseUrl  = p.get("url");
@@ -86,18 +76,17 @@ async function DataCollector(currentUrl, context) {
     const fnNameMatch = js.match(
       /\bc\s*&&\s*d\.set\([^,]+,\s*encodeURIComponent\(\s*([a-zA-Z0-9$]+)\(/
     );
-    if (!fnNameMatch) throw new Error("Cannot locate signature cipher function in player script.");
+    if (!fnNameMatch) throw new Error("Cannot locate cipher function in player script.");
     const fnName = fnNameMatch[1];
 
-    const esc = fnName.replace(/[$]/g, "\\$");
-    const fnMatch = js.match(new RegExp(esc + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}"));
+    const esc      = fnName.replace(/[$]/g, "\\$");
+    const fnMatch  = js.match(new RegExp(esc + "\\s*=\\s*function\\([a-z]\\)\\{([^}]+)\\}"));
     if (!fnMatch) throw new Error("Cannot extract cipher function body.");
-    const fnBody = fnMatch[1];
+    const fnBody   = fnMatch[1];
 
     const helperName = (fnBody.match(/([a-zA-Z0-9$]{2,})\./) || [])[1];
-    if (!helperName) throw new Error("Cannot find cipher helper object name.");
-
-    const escH = helperName.replace(/[$]/g, "\\$");
+    if (!helperName) throw new Error("Cannot find cipher helper name.");
+    const escH       = helperName.replace(/[$]/g, "\\$");
     const helperMatch = js.match(new RegExp("var\\s+" + escH + "\\s*=\\s*\\{[\\s\\S]*?\\};"));
     if (!helperMatch) throw new Error("Cannot extract cipher helper object.");
 
@@ -111,22 +100,20 @@ async function DataCollector(currentUrl, context) {
 
   } else {
     const keys = Object.keys(audioFormat).join(", ");
-    throw new Error("Unexpected stream format (itag " + audioFormat.itag + "). Available keys: " + keys);
+    throw new Error("Unexpected stream format (itag " + audioFormat.itag + "). Keys: " + keys);
   }
 
-  const urlObj = new URL(audioUrl);
-
   // ── 4. Descramble n parameter ─────────────────────────────────────────────────
-  // The CDN returns 403 for any URL whose `n` param hasn't been run through
-  // YouTube's descrambling function from base.js.
+  const urlObj = new URL(audioUrl);
+  const nRaw   = urlObj.searchParams.get("n");
   let _n = "no n param";
-  const nRaw = urlObj.searchParams.get("n");
+
   if (nRaw) {
     try {
       const nOut = descrambleN(js, nRaw);
       if (nOut !== nRaw) {
         urlObj.searchParams.set("n", nOut);
-        _n = "ok";
+        _n = "ok: " + nRaw + " → " + nOut;
       } else {
         _n = "warn: same value returned";
       }
@@ -135,126 +122,143 @@ async function DataCollector(currentUrl, context) {
     }
   }
 
-  // ── 5. Attach proof-of-origin token (pot) if available ───────────────────────
-  // Some streams require a pot to authenticate the download.
-  // YouTube stores it in the player response or page config.
+  // ── 5. Attach pot token if available ─────────────────────────────────────────
   let _pot = "none";
   try {
-    const pot =
-      streamingData.serviceIntegrityDimensions?.poToken ||
-      pr.playerConfig?.mediaCommonConfig?.dynamicReadaheadConfig?.poToken ||
-      window.ytcfg?.data_?.INNERTUBE_CONTEXT?.client?.screenDensityFloat && // guard
-        undefined; // ytcfg doesn't carry pot directly; keep for future
-
-    if (pot) {
-      urlObj.searchParams.set("pot", pot);
-      _pot = "attached";
-    }
+    const pot = streamingData.serviceIntegrityDimensions?.poToken ||
+                pr.playerConfig?.mediaCommonConfig?.dynamicReadaheadConfig?.poToken;
+    if (pot) { urlObj.searchParams.set("pot", pot); _pot = "attached"; }
   } catch (_) {}
 
   audioUrl = urlObj.toString();
 
-  // ── 6. Validate the URL ───────────────────────────────────────────────────────
-  // Fetch with HEAD so we know the URL works before handing it to the downloader.
-  // Runs in page context so YouTube session cookies are included automatically.
+  // ── 6. Validate URL before returning ─────────────────────────────────────────
   let _valid = "unchecked";
   try {
-    const check = await fetch(audioUrl, { method: "HEAD" });
+    const check = await fetch(audioUrl, { method: "HEAD", credentials: "include" });
     if (check.ok || check.status === 206) {
       _valid = "ok (" + check.status + ")";
     } else {
       _valid = "FAILED (" + check.status + ")";
       throw new Error(
-        "CDN rejected URL (" + check.status + "). n=" + _n + " pot=" + _pot +
-        ". Try refreshing the page and running Get Data again."
+        "CDN rejected URL (" + check.status + ")  n=" + _n + "  pot=" + _pot
       );
     }
   } catch (e) {
-    if (e.message.includes("CDN rejected")) throw e;
-    // fetch itself failed (network error, CORS) — proceed and let the download try
-    _valid = "fetch error: " + e.message;
+    if (e.message.startsWith("CDN rejected")) throw e;
+    _valid = "fetch-error: " + e.message;
   }
 
   const mimeType = audioFormat.mimeType || "";
   const ext = isCombined ? "mp4" : mimeType.includes("webm") ? "webm" : "m4a";
 
-  return {
-    title,
-    audioUrl,
-    filename: `${title}.${ext}`,
-    itag: audioFormat.itag,
-    mimeType,
-    isCombined,
-    _n,
-    _pot,
-    _valid,
-  };
+  return { title, audioUrl, filename: `${title}.${ext}`,
+           itag: audioFormat.itag, mimeType, isCombined, _n, _pot, _valid };
 }
 
 // ─── descrambleN ─────────────────────────────────────────────────────────────
+// Finds and executes YouTube's n-parameter descrambling function from base.js.
+// Throws a descriptive error at each step so _n in the output shows exactly what broke.
 
 function descrambleN(js, nRaw) {
-  // Pattern 1: .get("n"))&&(b=Ref(b)   — most common
-  // Pattern 2: (b=Ref(b),x.set("n",b)  — minified variant
-  // Pattern 3: b=Ref(b);x.set("n",b)   — statement variant
-  const refMatch =
-    js.match(/\.get\("n"\)\)&&\(b=([a-zA-Z0-9$[\].]+)\(b\)/) ||
-    js.match(/\(b=([a-zA-Z0-9$[\].]+)\(b\)[,;][a-z]\.set\("n",b\)/) ||
-    js.match(/\bb=([a-zA-Z0-9$[\].]+)\(b\);[a-zA-Z]\.set\("n",b\)/);
+  // YouTube obfuscates the n-descrambler reference in many forms.
+  // All patterns capture: [1]=variable letter, [2]=function reference (e.g. "Nqa[0]")
+  // \1 backreference ensures the same variable is used throughout.
+  // \s* handles any whitespace that may be present after minification.
+  const PATTERNS = [
+    // .get("n"))&&(V=REF(V)   — most common in 2024-2025 players
+    /\.get\("n"\)\)\s*&&\s*\(\s*([a-zA-Z])\s*=\s*([a-zA-Z0-9$[\].]+)\(\s*\1\s*\)/,
+    // V&&(V=REF(V)            — split-statement form
+    /\b([a-zA-Z])\s*&&\s*\(\s*\1\s*=\s*([a-zA-Z0-9$[\].]+)\(\s*\1\s*\)/,
+    // V=REF(V),...set("n",V)  — comma-chain form
+    /\b([a-zA-Z])\s*=\s*([a-zA-Z0-9$[\].]+)\(\s*\1\s*\)\s*,\s*[a-zA-Z.[\]]+\.set\(\s*"n"\s*,\s*\1\s*\)/,
+    // set("n",REF(V))         — inline form
+    /\.set\(\s*"n"\s*,\s*([a-zA-Z0-9$[\].]+)\(\s*([a-zA-Z])\s*\)\s*\)/,
+    // V=REF(V);...set("n"     — semicolon-statement form
+    /\b([a-zA-Z])\s*=\s*([a-zA-Z0-9$[\].]+)\(\s*\1\s*\)\s*;\s*[a-zA-Z.[\]]+\.set\(\s*"n"/,
+  ];
 
-  if (!refMatch) throw new Error("n-descrambler reference not found in player script");
+  let ref = null;
+  for (const pat of PATTERNS) {
+    const m = js.match(pat);
+    if (m) {
+      // Pattern 4 captures (ref, var); all others capture (var, ref)
+      ref = (pat === PATTERNS[3]) ? m[1] : m[2];
+      break;
+    }
+  }
+  if (!ref) throw new Error("n-descrambler reference not found in player script");
 
-  const ref        = refMatch[1];
   const arrayMatch = ref.match(/^([a-zA-Z0-9$]+)\[(\d+)\]$/);
-  let fnArg, fnBody;
 
   if (arrayMatch) {
-    // e.g. Nw[0] — find: var Nw=[function(a){...}]
-    const arrName = arrayMatch[1];
-    const esc     = arrName.replace(/[$]/g, "\\$");
+    const [, arrName, idxStr] = arrayMatch;
+    const idx = parseInt(idxStr, 10);
+    const esc = arrName.replace(/[$]/g, "\\$");
 
-    const startRe    = new RegExp("var\\s+" + esc + "\\s*=\\s*\\[function\\(([^)]+)\\)\\{");
+    // Support var / let / const declarations
+    const startRe    = new RegExp("(?:var|let|const)\\s+" + esc + "\\s*=\\s*\\[");
     const startMatch = js.match(startRe);
-    if (!startMatch) throw new Error("array var '" + arrName + "' not found as [function(");
+    if (!startMatch) throw new Error("array '" + arrName + "' declaration not found");
 
-    fnArg = startMatch[1];
-    const bodyStart = js.indexOf("{", startMatch.index + startMatch[0].length - 1);
-    fnBody = extractBody(js, bodyStart);
-    if (!fnBody) throw new Error("body extraction failed for array fn '" + arrName + "'");
+    const bracketPos = startMatch.index + startMatch[0].length - 1;
+    const arrLiteral = extractBrackets(js, bracketPos);
+    if (!arrLiteral) throw new Error("could not extract array '" + arrName + "' literal");
+
+    let arr;
+    try { arr = new Function("return " + arrLiteral)(); }
+    catch (e) { throw new Error("array '" + arrName + "' eval: " + e.message); }
+
+    if (typeof arr[idx] !== "function")
+      throw new Error(arrName + "[" + idx + "] is " + typeof arr[idx] + ", expected function");
+
+    return arr[idx](nRaw);
 
   } else {
-    // e.g. descramble — find: var descramble=function(a){...}
     const esc        = ref.replace(/[$]/g, "\\$");
-    const startRe    = new RegExp("(?:var\\s+)?" + esc + "\\s*=\\s*function\\(([^)]+)\\)\\s*\\{");
+    const startRe    = new RegExp("(?:(?:var|let|const)\\s+)?" + esc + "\\s*=\\s*function\\(([^)]+)\\)\\s*\\{");
     const startMatch = js.match(startRe);
-    if (!startMatch) throw new Error("fn '" + ref + "' not found as function(");
+    if (!startMatch) throw new Error("function '" + ref + "' definition not found");
 
-    fnArg = startMatch[1];
+    const arg       = startMatch[1];
     const bodyStart = js.indexOf("{", startMatch.index + startMatch[0].length - 1);
-    fnBody = extractBody(js, bodyStart);
-    if (!fnBody) throw new Error("body extraction failed for fn '" + ref + "'");
-  }
+    const body      = extractBody(js, bodyStart);
+    if (!body) throw new Error("could not extract body of '" + ref + "'");
 
-  return new Function(fnArg, fnBody)(nRaw);
+    try { return new Function(arg, body)(nRaw); }
+    catch (e) { throw new Error("function '" + ref + "' execution: " + e.message); }
+  }
 }
 
-// Brace-depth scan to extract a JS function body (content between outer { }).
-function extractBody(src, openBrace) {
-  if (src[openBrace] !== "{") return null;
-  let depth = 0;
-  let inStr = null;
-  for (let i = openBrace; i < src.length; i++) {
-    const c = src[i];
+// Extracts a balanced [...] block starting at openBracket.
+// Handles string literals so braces/brackets inside strings don't confuse the counter.
+function extractBrackets(src, openBracket) {
+  if (src[openBracket] !== "[") return null;
+  let depth = 0, inStr = null;
+  for (let i = openBracket; i < src.length; i++) {
+    const c = src[i], prev = src[i - 1];
     if (inStr) {
-      if (c === inStr && src[i - 1] !== "\\") inStr = null;
+      if (c === inStr && prev !== "\\") inStr = null;
     } else if (c === '"' || c === "'" || c === "`") {
       inStr = c;
-    } else if (c === "{") {
-      depth++;
-    } else if (c === "}") {
-      depth--;
-      if (depth === 0) return src.slice(openBrace + 1, i);
-    }
+    } else if (c === "[") { depth++; }
+    else if (c === "]") { if (--depth === 0) return src.slice(openBracket, i + 1); }
+  }
+  return null;
+}
+
+// Extracts a balanced {...} body starting at openBrace.
+function extractBody(src, openBrace) {
+  if (src[openBrace] !== "{") return null;
+  let depth = 0, inStr = null;
+  for (let i = openBrace; i < src.length; i++) {
+    const c = src[i], prev = src[i - 1];
+    if (inStr) {
+      if (c === inStr && prev !== "\\") inStr = null;
+    } else if (c === '"' || c === "'" || c === "`") {
+      inStr = c;
+    } else if (c === "{") { depth++; }
+    else if (c === "}") { if (--depth === 0) return src.slice(openBrace + 1, i); }
   }
   return null;
 }
