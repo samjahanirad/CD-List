@@ -1,7 +1,7 @@
 // CD Metadata
 const CD_ID = "youtube-audio";
 const CD_NAME = "YouTube Audio Downloader";
-const CD_VERSION = "3.0.0";
+const CD_VERSION = "3.1.0";
 const CD_DESCRIPTION = "Downloads the audio track of the current YouTube video as .m4a or .webm.";
 
 // ─── DataCollector ────────────────────────────────────────────────────────────
@@ -71,8 +71,8 @@ async function DataCollector(currentUrl, context) {
   if (audioFormat.url) {
     audioUrl = audioFormat.url;
 
-  } else if (audioFormat.signatureCipher) {
-    const p = new URLSearchParams(audioFormat.signatureCipher);
+  } else if (audioFormat.signatureCipher || audioFormat.cipher) {
+    const p = new URLSearchParams(audioFormat.signatureCipher || audioFormat.cipher);
     const encSig  = p.get("s");
     const sigParam = p.get("sp") || "sig";
     const baseUrl  = p.get("url");
@@ -105,7 +105,8 @@ async function DataCollector(currentUrl, context) {
     audioUrl = baseUrl + "&" + sigParam + "=" + encodeURIComponent(decSig);
 
   } else {
-    throw new Error("Unexpected stream format: no url or signatureCipher found.");
+    const keys = Object.keys(audioFormat).join(", ");
+    throw new Error("Unexpected stream format (itag " + audioFormat.itag + "). Available keys: " + keys);
   }
 
   const urlObj = new URL(audioUrl);
