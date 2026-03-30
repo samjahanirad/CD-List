@@ -10,7 +10,7 @@
   {
     "id": "youtube-audio",
     "name": "YouTube Audio Downloader",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "description": "Downloads the audio track of the current YouTube video as .m4a or .webm.",
     "rawUrl": "https://raw.githubusercontent.com/samjahanirad/CD-List/main/youtube-audio/index.js",
     "tags": ["youtube", "audio", "download"]
